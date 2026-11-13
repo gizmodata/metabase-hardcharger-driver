@@ -8,17 +8,19 @@
   password the tests fail, they never skip."
   (:require
    [clojure.java.jdbc :as jdbc]
+   [clojure.string :as str]
    [metabase.driver :as driver]
    [metabase.driver.hardcharger]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
-   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
    [metabase.driver.sql.util :as sql.u]
+   [metabase.query-processor.alternative-date-test :as adt]
    [metabase.test.data.interface :as tx]
    [metabase.test.data.sql :as sql.tx]
    [metabase.test.data.sql-jdbc :as sql-jdbc.tx]
-   [metabase.test.data.sql-jdbc.load-data :as load-data]
-   [metabase.test.data.sql.ddl :as ddl]
-   [metabase.util.log :as log]))
+   [metabase.test.data.sql-jdbc.load-data :as load-data])
+  (:import
+   (java.time LocalDateTime)))
 
 (set! *warn-on-reflection* true)
 
@@ -123,7 +125,7 @@
       sql
       ;; "... PRIMARY KEY (id)) ;" -> "... PRIMARY KEY (id), FOREIGN KEY ...) ;"
       (let [end (.lastIndexOf ^String sql ")")]
-        (str (subs sql 0 end) ", " (clojure.string/join ", " fks) (subs sql end))))))
+        (str (subs sql 0 end) ", " (str/join ", " fks) (subs sql end))))))
 
 (defn- parents-first
   "`tabledefs` ordered so that every table follows the tables its foreign keys point at. Tables in a cycle keep
@@ -175,6 +177,20 @@
                (isa? (:base_type field) :type/Integer))
       {:base_type :type/BigInteger}))))
 
-(defmethod driver/database-supports? [:hardcharger :test/time-type] [_driver _feature _database] true)
+;;; ------------------------------------- What the suite does not run, and why -------------------------------------
 
-(comment log/keep-me sql-jdbc.execute/keep-me ddl/keep-me)
+(doseq [[feature supported? _why]
+        [;; DuckDB has no materialized views (CREATE MATERIALIZED VIEW is not implemented).
+         [::describe-table-test/describe-materialized-view-fields false]
+         ;; These datasets give their binary column's SQL type in a map keyed by Metabase's own drivers
+         ;; (`:natives {"postgres" "BYTEA", ...}`), which a driver outside Metabase's tree cannot add to. The
+         ;; conversions themselves (`cast-temporal-byte`) are tested in metabase.driver.hardcharger-test.
+         [::adt/yyyymmddhhss-binary-timestamps false]]]
+  (defmethod driver/database-supports? [:hardcharger feature] [_driver _feature _database] supported?))
+
+;; strptime answers a TIMESTAMP
+(defmethod adt/yyyymmddhhmmss-dates-expected-rows :hardcharger
+  [_driver]
+  [[1 "foo" (LocalDateTime/parse "2019-04-21T16:43:00")]
+   [2 "bar" (LocalDateTime/parse "2020-04-21T16:43:00")]
+   [3 "baz" (LocalDateTime/parse "2021-04-21T16:43:00")]])

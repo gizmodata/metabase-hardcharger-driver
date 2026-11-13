@@ -5,6 +5,7 @@
   Hardcharger JDBC driver (`com.gizmodata/hardcharger-jdbc`, a thin layer over `chargewire-jdbc`), and generates
   DuckDB SQL."
   (:require
+   [clojure.java.jdbc :as jdbc]
    [clojure.string :as str]
    [java-time.api :as t]
    [metabase.driver :as driver]
@@ -29,7 +30,7 @@
    (java.net URLDecoder URLEncoder)
    (java.nio.charset StandardCharsets)
    (java.sql Connection PreparedStatement ResultSet ResultSetMetaData SQLException Types)
-   (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime)
+   (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneId ZoneOffset ZonedDateTime)
    (java.time.format DateTimeFormatter)
    (java.util Collections Map WeakHashMap)
    (java.util.concurrent Executors)))
@@ -79,6 +80,10 @@
          :regex/lookaheads-and-lookbehinds     false
          ;; GROUP BY GROUPING SETS with GROUPING(a, b, ...)
          :native-pivot-tables                  true
+         ;; Metabase parses native SQL with sqlglot, under a dialect it picks from the driver's name in a closed
+         ;; list (metabase.sql-tools.sqlglot.core/driver->dialect); an unlisted driver's name is passed on as the
+         ;; dialect, and sqlglot has none called "hardcharger". So what depends on parsing native SQL is off.
+         :dependencies/native                  false
          ;; One Metabase database is one catalog; other catalogs are reachable from SQL by their full name.
          :multi-level-schema                   false
          :connection/multiple-databases        false
@@ -460,6 +465,14 @@
                 " ORDER BY table_schema, table_name")]
           excluded)))
 
+(defn- query-rows
+  "The rows of `sql-args` as maps, on a connection of `database`'s own (a Database, its id or its metadata)."
+  [driver database sql-args]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver database nil
+   (fn [^Connection conn]
+     (into [] (jdbc/reducible-query {:connection conn} sql-args {:identifiers identity})))))
+
 (defmethod driver/describe-database* :hardcharger
   [driver database]
   (let [[inclusion-patterns exclusion-patterns] (schema-filter-patterns driver database)]
@@ -472,7 +485,7 @@
                         {:schema      schema
                          :name        name
                          :description (non-blank description)})))
-           (sql-jdbc.execute/reducible-query database (describe-database-sql driver)))}))
+           (query-rows driver database (describe-database-sql driver)))}))
 
 (defmethod sql-jdbc.sync/describe-fields-sql :hardcharger
   [driver & {:keys [schema-names table-names]}]
@@ -532,20 +545,18 @@
           [excluded schemas tables])))
 
 (defmethod driver/table-exists? :hardcharger
-  [_driver database {:keys [schema name]}]
+  [driver database {:keys [schema name]}]
   (boolean
-   (seq (into []
-              (take 1)
-              (sql-jdbc.execute/reducible-query
-               database
-               (if schema
-                 [(str "SELECT 1 FROM information_schema.tables"
-                       " WHERE table_catalog = current_database() AND table_schema = ? AND table_name = ?")
-                  schema name]
-                 [(str "SELECT 1 FROM information_schema.tables"
-                       " WHERE table_catalog = current_database() AND table_schema = current_schema()"
-                       " AND table_name = ?")
-                  name]))))))
+   (seq (query-rows
+         driver database
+         (if schema
+           [(str "SELECT 1 AS found FROM information_schema.tables"
+                 " WHERE table_catalog = current_database() AND table_schema = ? AND table_name = ?")
+            schema name]
+           [(str "SELECT 1 AS found FROM information_schema.tables"
+                 " WHERE table_catalog = current_database() AND table_schema = current_schema()"
+                 " AND table_name = ?")
+            name])))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                            Reading and binding values                                          |
@@ -593,10 +604,39 @@
         obj
         (str obj)))))
 
-;; The JDBC driver has no parameter of a time with an offset (nor has Arrow): send the local time.
+;; A TIMESTAMP WITH TIME ZONE is an instant. The JDBC driver gives it at the session zone's offset; Metabase's
+;; drivers hand instants on at UTC, and the query processor shows them in the report time zone.
+(defmethod sql-jdbc.execute/read-column-thunk [:hardcharger Types/TIMESTAMP_WITH_TIMEZONE]
+  [_driver ^ResultSet rs _rsmeta ^Integer i]
+  (fn []
+    (some-> ^OffsetDateTime (.getObject rs i OffsetDateTime)
+            (.withOffsetSameInstant ZoneOffset/UTC))))
+
+;; A date or a date and time without a zone, compared with a TIMESTAMP WITH TIME ZONE, means that wall-clock time in
+;; the session's TimeZone: that is how DuckDB casts the SQL literal. The JDBC driver sends a parameter in the type
+;; the server gave it, and reads a zone-less value bound to a TIMESTAMP WITH TIME ZONE parameter at UTC instead
+;; (chargewire-jdbc 2.2.6; reported upstream). So for such a parameter the instant is worked out here, in the zone
+;; the query runs in, which is the zone this driver set on the session.
+(defn- timestamptz-parameter? [^PreparedStatement ps ^Integer i]
+  (try
+    (= (.getParameterType (.getParameterMetaData ps) i) Types/TIMESTAMP_WITH_TIMEZONE)
+    (catch Throwable _ false)))
+
+(defn- in-session-zone ^OffsetDateTime [^LocalDateTime t]
+  (.toOffsetDateTime (.atZone t (ZoneId/of (driver-api/results-timezone-id)))))
+
+(defmethod sql-jdbc.execute/set-parameter [:hardcharger LocalDateTime]
+  [_driver ^PreparedStatement ps ^Integer i ^LocalDateTime t]
+  (.setObject ps i (if (timestamptz-parameter? ps i) (in-session-zone t) t)))
+
+(defmethod sql-jdbc.execute/set-parameter [:hardcharger LocalDate]
+  [_driver ^PreparedStatement ps ^Integer i ^LocalDate t]
+  (.setObject ps i (if (timestamptz-parameter? ps i) (in-session-zone (.atStartOfDay t)) t)))
+
+;; The JDBC driver has no parameter of a time with an offset (nor has Arrow): send the time of day at UTC.
 (defmethod sql-jdbc.execute/set-parameter [:hardcharger OffsetTime]
   [_driver ^PreparedStatement ps ^Integer i ^OffsetTime t]
-  (.setObject ps i (.toLocalTime t)))
+  (.setObject ps i (.toLocalTime (.withOffsetSameInstant t ZoneOffset/UTC))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                 Generating SQL                                                 |
