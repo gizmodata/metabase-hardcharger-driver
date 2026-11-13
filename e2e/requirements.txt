@@ -1,0 +1,3 @@
+# What e2e/e2e.py needs. Pinned: the end-to-end check is a release gate.
+hardcharger==2.12.0
+playwright==1.65.1

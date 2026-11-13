@@ -1,0 +1,259 @@
+name: CI
+
+# Every check, on every push to main and every pull request, and the release gate: release.yml
+# calls this workflow on the tagged commit and publishes only if every job passed.
+#
+#   - build: the plugin jar, built by Metabase's own driver build against the Metabase version in
+#     metabase.version, its contents checked; clj-kondo with Metabase's lint configuration.
+#   - metabase-tests: Metabase's driver test suite (every test tagged :mb/driver-tests in its
+#     open-source test tree) and this driver's own tests, against a real hardcharger-server.
+#   - e2e: a real Metabase (the Docker image of that version) with the built jar, against real
+#     hardcharger-servers: plugin, sync, queries, time zone, cancel, dashboard in a browser, TLS.
+#
+# The tests need a server: they FAIL when there is none. Nothing skips for that.
+#
+# Access, with no personal token: Metabase's source and Docker image are public; the
+# hardcharger-server binary is downloaded by the `hardcharger` PyPI package from GitHub's release
+# downloads, authenticated with this workflow's own token so the download isn't rate limited.
+
+on:
+  push:
+    branches: [main]
+    # Documentation that nothing builds, tests or packages. LICENSE, NOTICE and
+    # THIRD-PARTY-NOTICES.md are NOT here: they are packaged into the jar.
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+      - "CLAUDE.md"
+      - "docs/**"
+  # Every pull request runs, documentation-only ones too: "CI result" is the check to require in
+  # branch protection, and a required check that never reports would block the merge.
+  pull_request:
+  workflow_dispatch:
+  # release.yml's gate.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A newer run on the same branch cancels the older one; a run on a tag is never cancelled.
+# Called from release.yml, github.workflow is the caller's name ("Release"), so this group is
+# "Release-refs/tags/vX.Y.Z": release.yml's own group has another name, or the two would wait
+# on each other for ever.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CLOJURE_CLI_VERSION: "1.12.6.1673"
+  UV_VERSION_PIN: "0.13.5"
+  # The released server binary is downloaded from GitHub: authenticate so it isn't rate limited.
+  HARDCHARGER_INSTALL_TOKEN: ${{ github.token }}
+
+jobs:
+  # A push to main of a commit this workflow already passed on (a fast-forward merge of a tested
+  # branch) doesn't test it again. Tags, pull requests and manual runs always test.
+  gate:
+    name: Already tested?
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run=true
+          reason="a $EVENT run on $REF"
+          if [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
+            passed=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success" --jq '.total_count')
+            if [ "$passed" -gt 0 ]; then
+              run=false
+              reason="commit $SHA already passed this workflow $passed time(s)"
+            fi
+          fi
+          echo "run=$run ($reason)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "**Tests:** run=\`$run\` ($reason)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build the jar, lint
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.7.0
+        with:
+          cli: ${{ env.CLOJURE_CLI_VERSION }}
+          github-token: ${{ github.token }}
+      # Maven and git dependencies of Metabase and its drivers. Keyed on the Metabase version and
+      # this driver's dependencies; a cache miss only costs the downloads.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('metabase.version', 'deps.edn') }}
+          restore-keys: |
+            deps-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check out Metabase and register the driver
+        run: ci/checkout-metabase.sh "$RUNNER_TEMP/metabase"
+      - name: Build the plugin jar and check its contents
+        run: ci/build-jar.sh "$RUNNER_TEMP/metabase"
+      - name: Lint (clj-kondo, with Metabase's configuration)
+        run: ci/lint.sh "$RUNNER_TEMP/metabase"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hardcharger-metabase-driver
+          path: |
+            dist/hardcharger.metabase-driver.jar
+            dist/hardcharger.metabase-driver.jar.sha256
+          if-no-files-found: error
+
+  metabase-tests:
+    name: Metabase's driver test suite (${{ matrix.partition }} of 3)
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Metabase's test runner splits the suite deterministically; three runners share it.
+        partition: [0, 1, 2]
+    env:
+      MB_HARDCHARGER_TEST_HOST: 127.0.0.1
+      MB_HARDCHARGER_TEST_PORT: "31337"
+      MB_HARDCHARGER_TEST_USER: hardcharger
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.7.0
+        with:
+          cli: ${{ env.CLOJURE_CLI_VERSION }}
+          github-token: ${{ github.token }}
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION_PIN }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('metabase.version', 'deps.edn') }}
+          restore-keys: |
+            deps-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check out Metabase and register the driver
+        run: ci/checkout-metabase.sh "$RUNNER_TEMP/metabase"
+      # The server binary comes from GitHub's release downloads, which answer 5xx now and then.
+      # Fetch it once, with retries; the tests still fail if no server can be had.
+      - name: Download the Hardcharger server
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" -r e2e/requirements.txt
+          for attempt in 1 2 3 4 5; do
+            if "$RUNNER_TEMP/venv/bin/python" -m hardcharger download; then exit 0; fi
+            echo "download failed (attempt $attempt of 5)"
+            sleep $((attempt * 15))
+          done
+          exit 1
+      - name: Start a Hardcharger server
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          echo "MB_HARDCHARGER_TEST_PASSWORD=$password" >> "$GITHUB_ENV"
+          HARDCHARGER_ADMIN_PASSWORD="$password" \
+            ci/start-test-server.sh "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/hardcharger.log"
+      - name: Run the suite
+        env:
+          CHECK_TEST_RUN_ARGS: --partitions 3
+        run: ci/run-metabase-tests.sh "$RUNNER_TEMP/metabase" :partition/total 3 :partition/index ${{ matrix.partition }}
+      - name: The server's log, when something failed
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/hardcharger.log" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: metabase-tests-log-${{ matrix.partition }}
+          path: target/metabase-tests.log
+          if-no-files-found: warn
+
+  e2e:
+    name: End to end (Metabase in Docker, a browser)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: hardcharger-metabase-driver
+          path: dist
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION_PIN }}
+      - name: Install the check's packages and a browser
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" -r e2e/requirements.txt
+          "$RUNNER_TEMP/venv/bin/python" -m playwright install --with-deps chromium
+      - name: Download the Hardcharger server
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if "$RUNNER_TEMP/venv/bin/python" -m hardcharger download; then exit 0; fi
+            echo "download failed (attempt $attempt of 5)"
+            sleep $((attempt * 15))
+          done
+          exit 1
+      - name: Check the jar is the one the build job made
+        run: cd dist && sha256sum --check hardcharger.metabase-driver.jar.sha256
+      - name: Run the end-to-end check
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" e2e/e2e.py --jar dist/hardcharger.metabase-driver.jar \
+            --metabase-image "metabase/metabase:$(tr -d '[:space:]' < metabase.version)"
+
+  # The one check to require in branch protection: green only when every job above passed, or
+  # when the gate found this commit already tested.
+  result:
+    name: CI result
+    if: always()
+    needs: [gate, build, metabase-tests, e2e]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - env:
+          GATE: ${{ needs.gate.result }}
+          RUN: ${{ needs.gate.outputs.run }}
+          BUILD: ${{ needs.build.result }}
+          TESTS: ${{ needs.metabase-tests.result }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          echo "gate=$GATE run=$RUN build=$BUILD metabase-tests=$TESTS e2e=$E2E"
+          if [ "$GATE" != success ]; then exit 1; fi
+          if [ "$RUN" = false ]; then
+            echo "already tested: nothing to do"
+            exit 0
+          fi
+          if [ "$BUILD" != success ] || [ "$TESTS" != success ] || [ "$E2E" != success ]; then exit 1; fi

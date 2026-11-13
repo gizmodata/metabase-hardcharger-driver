@@ -1,0 +1,16 @@
+Metabase Hardcharger driver
+Copyright 2026 GizmoData LLC
+
+This product includes software developed at GizmoData LLC (https://gizmodata.com).
+
+It was written after two Apache-2.0 Metabase drivers: GizmoData's Metabase GizmoSQL driver
+(https://github.com/gizmodata/metabase-gizmosql-driver, itself a fork of
+J0hnG4lt/metabase-flightsql-driver) and MotherDuck's Metabase DuckDB driver
+(https://github.com/motherduckdb/metabase_duckdb_driver), whose DuckDB SQL mappings it follows.
+
+The plugin jar bundles the Hardcharger JDBC driver and the Chargewire JDBC driver (both Apache-2.0,
+Copyright 2026 GizmoData LLC) and the third-party software inside the latter: see
+THIRD-PARTY-NOTICES.md, which is in the jar under META-INF/licenses/metabase-hardcharger-driver/.
+
+Metabase is a trademark of Metabase, Inc. This driver is not affiliated with or endorsed by
+Metabase, Inc. Hardcharger and GizmoData are trademarks of GizmoData LLC.

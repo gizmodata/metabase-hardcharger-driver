@@ -320,6 +320,21 @@ def add_database(mb: Metabase, server: hardcharger.Server) -> tuple[int, dict, d
           fields[("shop", "all_types")]["c_dec"]["database_type"] == "DECIMAL(18,3)",
           fields[("shop", "all_types")]["c_dec"]["database_type"])
 
+    # The first sync goes on to fingerprint the columns and scan their values.
+    status_field = orders["status"]["id"]
+    deadline = time.monotonic() + 120
+    fingerprint, values = None, []
+    while time.monotonic() < deadline:
+        fingerprint = mb.get(f"/api/field/{orders['amount']['id']}").get("fingerprint")
+        values = [v[0] for v in mb.get(f"/api/field/{status_field}/values").get("values", [])]
+        if fingerprint and values:
+            break
+        time.sleep(2)
+    check("a number column was fingerprinted",
+          bool(fingerprint) and fingerprint["type"]["type/Number"]["min"] == 10
+          and fingerprint["type"]["type/Number"]["max"] == 70, fingerprint)
+    check("a category column's values were scanned", sorted(values) == sorted(STATUSES), values)
+
     table_ids = {name: table["id"] for (_, name), table in tables.items()}
     field_ids = {f"{name}.{f}": field["id"] for (_, name), fs in fields.items() for f, field in fs.items()}
     return database_id, table_ids, field_ids
@@ -791,8 +806,8 @@ def main() -> int:
             "-p", f"127.0.0.1:{metabase_port}:3000",
             "-v", f"{plugins}:/plugins",
             "-e", "MB_PLUGINS_DIR=/plugins",
+            # No JAVA_OPTS: the README says the driver needs none.
             "-e", "MB_CHECK_FOR_UPDATES=false", "-e", "MB_ANON_TRACKING_ENABLED=false",
-            "-e", "JAVA_TIMEZONE=UTC",
             args.metabase_image,
         ])
         started_container = True

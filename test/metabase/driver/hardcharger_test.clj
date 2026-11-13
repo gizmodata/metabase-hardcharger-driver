@@ -21,6 +21,7 @@
    [metabase.sync.core :as sync]
    [metabase.test :as mt]
    [metabase.test.data.interface :as tx]
+   [metabase.util :as u]
    [toucan2.core :as t2])
   (:import
    (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset)))
@@ -519,7 +520,7 @@
   (mt/test-driver :hardcharger
     (testing "cancelling a question cancels its statement on the server, and the connection is fine afterwards"
       (let [canceled-chan (a/promise-chan)
-            started       (System/currentTimeMillis)
+            timer         (u/start-timer)
             result        (future
                             (try
                               (binding [qp.pipeline/*canceled-chan* canceled-chan]
@@ -529,7 +530,7 @@
         (is (not (realized? result)) "the slow query is still running: without that this test proves nothing")
         (a/>!! canceled-chan ::cancel)
         (let [outcome (deref result 20000 ::still-running)
-              elapsed (- (System/currentTimeMillis) started)]
+              elapsed (u/since-ms timer)]
           (is (not= ::still-running outcome) "the query ended once it was cancelled")
           (is (< elapsed 15000) (str "it ended " elapsed " ms after it started")))
         (is (= [[42]] (native-rows "SELECT 42")))))))
@@ -537,13 +538,13 @@
 (deftest query-timeout-test
   (mt/test-driver :hardcharger
     (testing "a statement that outlives Metabase's query timeout is stopped by the server"
-      (let [started (System/currentTimeMillis)
+      (let [timer   (u/start-timer)
             error   (binding [driver.settings/*query-timeout-ms* 2000]
                       (try
                         (qp/process-query (mt/native-query {:query slow-sql}))
                         nil
                         (catch Throwable e e)))
-            elapsed (- (System/currentTimeMillis) started)]
+            elapsed (u/since-ms timer)]
         (is (some? error))
         (is (re-find #"(?i)timeout|cancel" (str (ex-message error) " " (some-> error ex-cause ex-message))))
         (is (< elapsed 15000) (str "stopped after " elapsed " ms")))

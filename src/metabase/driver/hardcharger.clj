@@ -73,7 +73,9 @@
          :expressions/text                     true
          :expressions/today                    true
          :split-part                           true
-         :uuid-type                            true
+         ;; UUID columns sync as UUIDs and can be filtered and joined on, but their values arrive as text (see
+         ;; the README's type table), which is not what this flag promises. Only H2 and PostgreSQL set it.
+         :uuid-type                            false
          :identifiers-with-spaces              true
          :schemas                              true
          ;; DuckDB's regular expressions are RE2: no lookaheads or lookbehinds
@@ -257,12 +259,6 @@
   ;; a path on the connection's own host
   ["basePath"])
 
-(defn- exception-chain [^Throwable e]
-  (take-while some? (iterate #(.getCause ^Throwable %) e)))
-
-(defn- sql-state [^Throwable e]
-  (some #(when (instance? SQLException %) (.getSQLState ^SQLException %)) (exception-chain e)))
-
 (defmethod driver/humanize-connection-error-message :hardcharger
   [_driver messages]
   (let [message (str (first messages))]
@@ -286,7 +282,8 @@
       (str "The server's TLS certificate could not be verified. Add its certificate authority under "
            "\"Server CA certificate (PEM)\" in the advanced options. (" message ")")
 
-      #"(?i)^Cannot connect to|ConnectException|Connection refused|timed out"
+      ;; (Metabase's own "Timed out after ..." is left as it is: a slow server is not a wrong host.)
+      #"(?i)^Cannot connect to|ConnectException|Connection refused"
       :cannot-connect-check-host-and-port
 
       #"(?i)No catalog \+ schema named"
@@ -543,6 +540,13 @@
                 " ORDER BY fk.table_schema, fk.table_name, fk.ordinal_position")]
           cat
           [excluded schemas tables])))
+
+;; The tables a native query depends on. Metabase finds the ones named in the SQL text by parsing it with
+;; sqlglot, which it cannot do for this driver (see :dependencies/native above), so this answers the ones that
+;; need no parsing: tables referenced through {{table}} template tags.
+(defmethod driver/native-query-deps :hardcharger
+  [_driver query]
+  (into #{} (driver-api/native-query-table-references query)))
 
 (defmethod driver/table-exists? :hardcharger
   [driver database {:keys [schema name]}]
