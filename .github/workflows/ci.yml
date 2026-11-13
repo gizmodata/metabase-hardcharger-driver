@@ -126,17 +126,15 @@ jobs:
             dist/hardcharger.metabase-driver.jar.sha256
           if-no-files-found: error
 
+  # One runner: the suite is about 3,500 tests and took 6 minutes on an 18-core laptop. If it is slow
+  # on the standard 4-core runner, Metabase's runner can split it (`:partition/total N
+  # :partition/index I`, with CHECK_TEST_RUN_ARGS="--partitions N"), or a larger runner can take it.
   metabase-tests:
-    name: Metabase's driver test suite (${{ matrix.partition }} of 3)
+    name: Metabase's driver test suite
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        # Metabase's test runner splits the suite deterministically; three runners share it.
-        partition: [0, 1, 2]
     env:
       MB_HARDCHARGER_TEST_HOST: 127.0.0.1
       MB_HARDCHARGER_TEST_PORT: "31337"
@@ -186,16 +184,14 @@ jobs:
           HARDCHARGER_ADMIN_PASSWORD="$password" \
             ci/start-test-server.sh "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/hardcharger.log"
       - name: Run the suite
-        env:
-          CHECK_TEST_RUN_ARGS: --partitions 3
-        run: ci/run-metabase-tests.sh "$RUNNER_TEMP/metabase" :partition/total 3 :partition/index ${{ matrix.partition }}
+        run: ci/run-metabase-tests.sh "$RUNNER_TEMP/metabase"
       - name: The server's log, when something failed
         if: failure()
         run: tail -n 200 "$RUNNER_TEMP/hardcharger.log" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: metabase-tests-log-${{ matrix.partition }}
+          name: metabase-tests-log
           path: target/metabase-tests.log
           if-no-files-found: warn
 

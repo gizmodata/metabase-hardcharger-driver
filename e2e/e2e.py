@@ -252,18 +252,21 @@ def make_certificates(directory: Path) -> dict[str, Path]:
 
 def check_plugin(mb: Metabase) -> None:
     print("1. plugin")
-    engines = mb.get("/api/session/properties")["engines"]
+    engines = mb.get("/api/setting/engines")
     check("the hardcharger engine is registered", "hardcharger" in engines, sorted(engines))
     engine = engines["hardcharger"]
     check("its display name is Hardcharger", engine.get("driver-name") == "Hardcharger", engine.get("driver-name"))
-    names = [p.get("name") for p in engine["details-fields"]]
-    for wanted in ["host", "port", "tls", "use-token", "user", "password", "catalog", "additional-options"]:
-        check(f"the connection form has {wanted}", wanted in names, names)
-    secret_like = {p.get("name"): p.get("type") for p in engine["details-fields"]}
-    check("the password field is a password", secret_like.get("password") == "password", secret_like)
-    token_fields = [n for n in names if n and n.startswith("token")]
-    check("the access token is a secret (expanded into token-* fields)", "token-value" in token_fields, token_fields)
-    check("the CA certificate is a secret", "tls-ca-certificate-value" in names, names)
+    types = {p.get("name"): p.get("type") for p in engine["details-fields"]}
+    for wanted in ["host", "port", "tls", "use-token", "user", "password", "catalog", "schema-filters-type",
+                   "tls-skip-verify", "mtls-sign-in", "additional-options"]:
+        check(f"the connection form has {wanted}", wanted in types, sorted(types))
+    check("the password is a password field", types.get("password") == "password", types.get("password"))
+    check("the access token is a secret", types.get("token-value") == "password", types.get("token-value"))
+    for secret in ["tls-ca-certificate", "mtls-certificate", "mtls-key"]:
+        check(f"{secret} is a secret (a file to upload, or a path on the server)",
+              types.get(f"{secret}-value") == "textFile" and f"{secret}-path" in types, sorted(types))
+    defaults = {p.get("name"): p.get("default") for p in engine["details-fields"]}
+    check("TLS is on by default", defaults.get("tls") is True, defaults.get("tls"))
 
 
 def add_database(mb: Metabase, server: hardcharger.Server) -> tuple[int, dict, dict]:
@@ -407,8 +410,10 @@ def check_queries(mb: Metabase, database_id: int, tables: dict, fields: dict) ->
     check("a view is queryable", rows == [[sum(1 for o in ORDERS if o["status"] == "paid")]], rows)
 
     answer = native("SELECT id, status, amount, created_at FROM shop.orders WHERE id = 7")
-    check("native SQL", answer["data"]["rows"] == [[7, "shipped", 10.0, "2026-01-01T21:00:00Z"]]
-          or [[r[0], r[1], float(r[2]), r[3]] for r in answer["data"]["rows"]] == [[7, "shipped", 10.0, "2026-01-01T21:00:00Z"]],
+    seven = ORDERS[7]
+    check("native SQL",
+          [[r[0], r[1], float(r[2]), r[3]] for r in answer["data"]["rows"]]
+          == [[7, seven["status"], float(seven["amount"]), "2026-01-01T21:00:00Z"]],
           answer["data"]["rows"])
 
     answer = mb.dataset({
@@ -455,8 +460,11 @@ def check_queries(mb: Metabase, database_id: int, tables: dict, fields: dict) ->
     answer = native("SELECT * FROM shop.all_types")
     row = dict(zip([c["name"] for c in answer["data"]["cols"]], answer["data"]["rows"][0]))
     check("values of every type come back readable", (
-        row["c_bool"] is True and row["c_hugeint"] == 12345678901234567890123456789
-        and row["c_ubigint"] == 18446744073709551615 and float(row["c_dec"]) == 12345.678 and row["c_dec0"] == 42
+        # (Metabase sends whole numbers too big for JavaScript as text)
+        row["c_bool"] is True and str(row["c_hugeint"]) == "12345678901234567890123456789"
+        and str(row["c_uhugeint"]) == "12345678901234567890123456789"
+        and str(row["c_ubigint"]) == "18446744073709551615" and float(row["c_dec"]) == 12345.678
+        and row["c_dec0"] == 42 and row["c_blob"] == "0xAABB"
         and row["c_uuid"] == "123e4567-e89b-12d3-a456-426614174000" and row["c_date"].startswith("2026-11-13")
         and row["c_time"].startswith("13:14:15.123456") and row["c_ts"].startswith("2026-11-13T13:14:15.123456")
         and row["c_ts_ns"].startswith("2026-11-13T13:14:15.123456") and row["c_tstz"] == "2026-11-13T13:14:15.123456Z"
@@ -643,16 +651,24 @@ def check_in_a_browser(mb: Metabase, password: str, dashboard_id: int, cards: di
 
         page.goto(f"{mb.base_url}/admin/databases/create")
         page.wait_for_load_state("networkidle")
-        # choose the engine; the list is a searchable picker
-        search = page.get_by_placeholder("Search databases")
-        if search.count():
-            search.first.fill("Hardcharger")
-        page.get_by_text("Hardcharger", exact=True).first.click()
+        # "Database type" is a searchable select
+        engine_select = page.get_by_role("textbox", name="Database type")
+        engine_select.click()
+        engine_select.fill("Hardcharger")
+        page.get_by_role("option", name="Hardcharger").click()
         expect(page.get_by_text("Use a secure connection (TLS)").first).to_be_visible(timeout=30_000)
         expect(page.get_by_text("Sign in with an access token").first).to_be_visible()
+        expect(page.get_by_text("Catalog", exact=True).first).to_be_visible()
         check("the connection form shows the driver's fields", True)
         if screenshots:
-            page.screenshot(path=str(screenshots / "connection-form.png"), full_page=True)
+            page.set_viewport_size({"width": 1100, "height": 1500})
+            page.get_by_text("Add a database").first.scroll_into_view_if_needed()
+            page.screenshot(path=str(screenshots / "connection-form.png"))
+        page.get_by_text("Show advanced options").first.click()
+        expect(page.get_by_text("Server CA certificate (PEM)").first).to_be_visible()
+        expect(page.get_by_text("Sign in with the client certificate").first).to_be_visible()
+        expect(page.get_by_text("Additional JDBC options").first).to_be_visible()
+        check("and, under advanced options, the certificate fields and the additional options", True)
 
         check("the browser saw no page error and no 5xx response", not problems, problems[:5])
         browser.close()
@@ -686,12 +702,15 @@ def check_errors(mb: Metabase, server: hardcharger.Server, tls_server: hardcharg
     check("an unknown catalog says so", "no catalog of that name" in text, text)
 
     print("9. additional options")
+    # Two guards: Metabase's own check knows the parameters this driver declares dangerous, and the driver's
+    # allowlist refuses whatever is not on it.
     text = refused({**database_details(server), "additional-options": "oauthBrowser=/usr/bin/touch /tmp/pwned"})
-    check("an option that names a program is refused", "oauthBrowser" in text or "not allowed" in text.lower()
-          or "disallowed" in text.lower(), text)
+    check("an option that names a program is refused", "dangerous" in text.lower(), text)
     text = refused({**database_details(server), "additional-options": "tlsRootCerts=/etc/passwd"})
-    check("an option that names a file is refused", "tlsRootCerts" in text or "not allowed" in text.lower()
-          or "disallowed" in text.lower(), text)
+    check("an option that names a file is refused", "dangerous" in text.lower(), text)
+    text = refused({**database_details(server), "additional-options": "user=someone-else"})
+    check("an option that is not on the allowlist is refused by name",
+          "Unsupported additional JDBC option" in text and "user" in text and "someone-else" not in text, text)
     text = refused({**database_details(server), "additional-options": "resultPartitions=abc"})
     check("a bad value of an allowed option is the JDBC driver's message", "resultPartitions" in text, text)
 
@@ -725,6 +744,25 @@ def check_tls(mb: Metabase, tls_server: hardcharger.Server, certificates: dict[s
     rows = mb.rows({"database": database["id"], "type": "native",
                     "native": {"query": "SELECT HARDCHARGER_USER() AS who"}})
     check("sign-in with the client certificate (its e-mail is the user)", rows == [["metabase@example.invalid"]], rows)
+
+
+def check_allowed_option(mb: Metabase, server: hardcharger.Server) -> None:
+    print("9b. an allowed additional option")
+    database = mb.post("/api/database", {
+        "engine": "hardcharger", "name": "Hardcharger with zstd results",
+        "details": database_details(server, catalog="memory",
+                                    **{"advanced-options": True,
+                                       "additional-options": "ipcCompression=zstd&resultPartitions=4"}),
+    })
+    # enough rows for several Arrow batches, so the result really is compressed and read in partitions
+    rows = mb.rows({"database": database["id"], "type": "native",
+                    "native": {"query": "SELECT count(*) AS n, sum(i) AS total FROM "
+                                        "(SELECT i FROM range(500000) t(i) ORDER BY i)"}})
+    check("a database with ipcCompression=zstd answers", rows == [[500000, 124999750000]], rows)
+    answer = mb.dataset({"database": database["id"], "type": "native",
+                         "native": {"query": "SELECT i, repeat('x', 20) AS pad FROM range(2000) t(i) ORDER BY i"}})
+    check("zstd-compressed rows arrive whole and in order",
+          [r[0] for r in answer["data"]["rows"]] == list(range(2000)), len(answer["data"]["rows"]))
 
 
 def check_access_token(mb: Metabase, server: hardcharger.Server) -> None:
@@ -792,8 +830,10 @@ def main() -> int:
     tls_server = hardcharger.Server(
         host="0.0.0.0", binary=binary, log_file=tls_log, env={"TZ": "UTC"},
         tls_cert=certificates["server"], tls_key=certificates["server_key"],
-        extra_args=["--no-web-ui", "--mtls-ca-cert", str(certificates["ca"]), "--mtls-certificate-sign-in",
-                    "--mtls-admin-identities", "metabase@example.invalid"],
+        # A client certificate is accepted and can sign in, but is not demanded: the same server also takes
+        # the password sign-in of the "TLS with a private CA" check.
+        extra_args=["--no-web-ui", "--mtls-ca-cert", str(certificates["ca"]), "--no-mtls-require-client-cert",
+                    "--mtls-certificate-sign-in", "--mtls-admin-identities", "metabase@example.invalid"],
     )
     mb = Metabase(base_url=f"http://127.0.0.1:{metabase_port}")
     try:
@@ -827,6 +867,7 @@ def main() -> int:
         else:
             check_in_a_browser(mb, admin_password, dashboard_id, cards, args.screenshots)
         check_errors(mb, server, tls_server)
+        check_allowed_option(mb, server)
         check_tls(mb, tls_server, certificates)
         check_access_token(mb, server)
 
@@ -834,6 +875,14 @@ def main() -> int:
         log_text = logs.stdout + logs.stderr
         for secret_value, what in [(server.password, "the database password"), (tls_server.password, "the TLS server's password")]:
             check(f"Metabase's log does not contain {what}", secret_value not in log_text)
+        check("the driver ran without a JVM option: no class-loading or native-library error in Metabase's log",
+              "InaccessibleObjectException" not in log_text and "UnsatisfiedLinkError" not in log_text
+              and "NoClassDefFoundError" not in log_text,
+              [line for line in log_text.splitlines()
+               if "Inaccessible" in line or "LinkError" in line or "NoClassDef" in line][:5])
+        if "sun.misc.Unsafe" in log_text:
+            # JDK 24+ prints this once for Arrow's memory access; it is a warning, and the README says so.
+            print("  note: the JVM printed its one-time sun.misc.Unsafe warning (Arrow, in the JDBC driver)")
         for log_path in (server_log, tls_log):
             check(f"{log_path.name} does not contain a password",
                   server.password not in log_path.read_text(errors="replace")

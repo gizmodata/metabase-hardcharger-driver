@@ -63,6 +63,10 @@ if [ "$in_jar" != "$version" ]; then
   exit 1
 fi
 
-(cd "$root/dist" && shasum -a 256 "$jar_name" > "$jar_name.sha256")
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$root/dist" && sha256sum "$jar_name" > "$jar_name.sha256")
+else
+  (cd "$root/dist" && shasum -a 256 "$jar_name" > "$jar_name.sha256")
+fi
 echo "built dist/$jar_name (driver $version, $(wc -c < "$root/dist/$jar_name" | tr -d ' ') bytes) against Metabase $(tr -d '[:space:]' < "$root/metabase.version")"
 cat "$root/dist/$jar_name.sha256"

@@ -96,7 +96,8 @@ be sure a native SQL question cannot change data, connect Metabase as a user tha
 
 **GizmoData Cloud clusters that stop when idle.** Metabase's connection pool never starts a stopped
 cluster, but its scheduled sync and scans do, like any query (by default every hour). To let a cluster
-sleep, give the database a less frequent schedule under **Scheduling** in its settings.
+sleep, turn on **Choose when syncs and scans happen** in the database's advanced options and pick a less
+frequent schedule.
 
 ## What works
 
