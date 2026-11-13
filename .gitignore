@@ -1,6 +1,8 @@
 # Build output
 /target/
 /dist/
+/resources/META-INF/
+/release-notes.md
 *.jar
 /.cpcache/
 /.clj-kondo/.cache/
@@ -10,7 +12,8 @@
 # Local Metabase checkout and caches used by the scripts
 /.metabase/
 
-# End-to-end stack
+# Python environment of `make test` and `make e2e`
+/.venv/
 /e2e/.venv/
 /e2e/.work/
 /e2e/node_modules/

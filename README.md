@@ -56,8 +56,11 @@ docker run -d --name metabase -p 3000:3000 \
   metabase/metabase:v0.65.4.3
 ```
 
-Each release also has `hardcharger.metabase-driver.jar.sha256` to check the download against. No JVM
-options are needed.
+Each release also has `hardcharger.metabase-driver.jar.sha256` to check the download against.
+
+No JVM options are needed. Metabase's Docker image runs Java 25, which prints a one-time warning that
+`sun.misc.Unsafe` was called (by Apache Arrow, inside the JDBC driver); it is harmless, and
+`-e JAVA_OPTS=--sun-misc-unsafe-memory-access=allow` silences it.
 
 ## Connect
 
@@ -163,12 +166,14 @@ For a column of unknown type the query builder offers little beyond showing and 
 
 | | Version |
 |---|---|
-| Metabase | **0.65.4.3** (the full test suite and the end-to-end check) |
+| Metabase | **0.65.4.3** (Metabase's driver test suite and the end-to-end check) and **0.65.1** (the end-to-end check) |
 | Hardcharger | **2.12.0** (DuckDB 2.0.0, Chargewire 2.4.1) |
 | Hardcharger JDBC driver (bundled) | 2.4.4, on the Chargewire JDBC driver 2.2.6 |
 
-The driver needs Metabase 0.65 or later: it uses driver interfaces that 0.65 added. Each release is built
-against the Metabase version in [`metabase.version`](metabase.version) and names it in its notes.
+The driver needs Metabase 0.65: it uses driver interfaces that 0.65 added, so it does not load in 0.64 or
+earlier. Each release is built against the Metabase version in [`metabase.version`](metabase.version), and
+CI also runs the end-to-end check with that jar on 0.65.1, the first stable 0.65. Later Metabase releases
+are expected to work and are not tested until `metabase.version` moves to them.
 
 Every push runs, against a real Hardcharger server:
 
@@ -202,7 +207,8 @@ make e2e      # the end-to-end check (Docker)
 ```
 
 It needs JDK 21, the [Clojure CLI](https://clojure.org/guides/install_clojure),
-[uv](https://docs.astral.sh/uv/), Docker and openssl. A Metabase driver is built inside a Metabase source
+[uv](https://docs.astral.sh/uv/) (for the test server's Python package, and because Metabase's tests
+install their SQL parser with it), Docker and openssl. A Metabase driver is built inside a Metabase source
 checkout: the first `make` clones Metabase at the version in `metabase.version` into
 `~/.cache/metabase-hardcharger-driver/` and links this repository into it. The `hardcharger` Python package
 downloads the server binary on first use; `HARDCHARGER_SERVER_BINARY` names another build.

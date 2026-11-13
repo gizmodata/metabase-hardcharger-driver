@@ -794,6 +794,7 @@ def main() -> int:
     parser.add_argument("--screenshots", type=Path, help="directory to write the README's screenshots to")
     parser.add_argument("--keep", action="store_true", help="leave Metabase and the servers running at the end")
     parser.add_argument("--no-browser", action="store_true", help="skip the browser step (not for the release gate)")
+    parser.add_argument("--java-opts", help="JAVA_OPTS for Metabase (the default is none, as the README promises)")
     args = parser.parse_args()
 
     jar = args.jar.resolve()
@@ -848,6 +849,7 @@ def main() -> int:
             "-e", "MB_PLUGINS_DIR=/plugins",
             # No JAVA_OPTS: the README says the driver needs none.
             "-e", "MB_CHECK_FOR_UPDATES=false", "-e", "MB_ANON_TRACKING_ENABLED=false",
+            *(["-e", f"JAVA_OPTS={args.java_opts}"] if args.java_opts else []),
             args.metabase_image,
         ])
         started_container = True
@@ -880,7 +882,10 @@ def main() -> int:
               and "NoClassDefFoundError" not in log_text,
               [line for line in log_text.splitlines()
                if "Inaccessible" in line or "LinkError" in line or "NoClassDef" in line][:5])
-        if "sun.misc.Unsafe" in log_text:
+        if args.java_opts and "--sun-misc-unsafe-memory-access=allow" in args.java_opts:
+            check("with --sun-misc-unsafe-memory-access=allow the JVM prints no sun.misc.Unsafe warning",
+                  "sun.misc.Unsafe" not in log_text)
+        elif "sun.misc.Unsafe" in log_text:
             # JDK 24+ prints this once for Arrow's memory access; it is a warning, and the README says so.
             print("  note: the JVM printed its one-time sun.misc.Unsafe warning (Arrow, in the JDBC driver)")
         for log_path in (server_log, tls_log):

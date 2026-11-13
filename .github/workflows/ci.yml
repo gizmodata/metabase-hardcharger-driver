@@ -151,6 +151,8 @@ jobs:
         with:
           cli: ${{ env.CLOJURE_CLI_VERSION }}
           github-token: ${{ github.token }}
+      # uv has two jobs here: it installs the `hardcharger` package that runs the server, and Metabase's
+      # test run itself calls `uv` to install sqlglot (its SQL parser) into its checkout on first use.
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           version: ${{ env.UV_VERSION_PIN }}
@@ -196,10 +198,16 @@ jobs:
           if-no-files-found: warn
 
   e2e:
-    name: End to end (Metabase in Docker, a browser)
+    name: End to end (Metabase ${{ matrix.metabase }}, in Docker, with a browser)
     needs: build
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # "target" is the version in metabase.version, which the jar is built against. The other is the
+        # oldest Metabase the README says the driver works with: the same jar must load there too.
+        metabase: [target, v0.65.1]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -227,9 +235,12 @@ jobs:
       - name: Check the jar is the one the build job made
         run: cd dist && sha256sum --check hardcharger.metabase-driver.jar.sha256
       - name: Run the end-to-end check
+        env:
+          METABASE: ${{ matrix.metabase }}
         run: |
+          if [ "$METABASE" = target ]; then METABASE="$(tr -d '[:space:]' < metabase.version)"; fi
           "$RUNNER_TEMP/venv/bin/python" e2e/e2e.py --jar dist/hardcharger.metabase-driver.jar \
-            --metabase-image "metabase/metabase:$(tr -d '[:space:]' < metabase.version)"
+            --metabase-image "metabase/metabase:$METABASE"
 
   # The one check to require in branch protection: green only when every job above passed, or
   # when the gate found this commit already tested.
