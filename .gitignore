@@ -1,0 +1,28 @@
+# Build output
+/target/
+/dist/
+*.jar
+/.cpcache/
+/.clj-kondo/.cache/
+/.lsp/
+/.nrepl-port
+
+# Local Metabase checkout and caches used by the scripts
+/.metabase/
+
+# End-to-end stack
+/e2e/.venv/
+/e2e/.work/
+/e2e/node_modules/
+__pycache__/
+*.pyc
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets never belong here
+.env
+*.pem
+!e2e/certs/README.md

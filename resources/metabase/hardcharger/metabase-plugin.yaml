@@ -1,0 +1,117 @@
+# Metabase plugin manifest for the Hardcharger driver.
+#
+# info.version is the project's version: the release workflow checks it against the tag, and
+# CHANGELOG.md has a section for it.
+info:
+  name: Metabase Hardcharger Driver
+  version: 1.0.0
+  description: Allows Metabase to connect to Hardcharger, GizmoData's DuckDB 2.0 server, over the Chargewire protocol.
+contact-info:
+  name: GizmoData
+  address: https://github.com/gizmodata/metabase-hardcharger-driver/issues
+driver:
+  name: hardcharger
+  display-name: Hardcharger
+  lazy-load: true
+  parent: sql-jdbc
+  connection-properties:
+    - merge:
+        - host
+        - placeholder: hardcharger.example.com
+          helper-text: The server's host name, without a scheme or a path.
+    # Not required: left empty, the JDBC driver uses 31337, or 443 for a GizmoData Cloud host.
+    - merge:
+        - port
+        - placeholder: 31337
+          required: false
+          helper-text: Leave empty for 31337, or 443 on a GizmoData Cloud host (*.gizmodata.com).
+    - name: tls
+      display-name: Use a secure connection (TLS)
+      type: boolean
+      default: true
+      description: Turn this off only for a server without TLS, such as one on localhost.
+    # Sign-in: a user name and password (the default), or an access token. Browser sign-in is not
+    # offered: Metabase connects from its server, where nobody could complete it.
+    - name: use-token
+      display-name: Sign in with an access token
+      type: boolean
+      default: false
+      description: Send a Chargewire access token instead of a user name and password.
+    - merge:
+        - user
+        - required: false
+          placeholder: hardcharger
+          visible-if:
+            use-token: false
+    - merge:
+        - password
+        - required: false
+          visible-if:
+            use-token: false
+    - name: token
+      display-name: Access token
+      type: secret
+      secret-kind: password
+      required: false
+      helper-text: Sent as is. The driver cannot renew it, so use one that outlives this connection's use.
+      visible-if:
+        use-token: true
+    - name: catalog
+      display-name: Catalog
+      type: string
+      required: false
+      placeholder: memory
+      helper-text: The catalog (database) to sync and query. Leave empty for the catalog the server starts sessions in.
+    - name: schema-filters
+      type: schema-filters
+      display-name: Schemas
+    - advanced-options-start
+    - name: tls-ca-certificate
+      display-name: Server CA certificate (PEM)
+      type: secret
+      secret-kind: pem-cert
+      required: false
+      helper-text: Extra certificate authorities to trust, for a server whose certificate a private CA signed.
+      visible-if:
+        advanced-options: true
+    - name: tls-skip-verify
+      display-name: Skip certificate verification
+      type: boolean
+      default: false
+      description: Accept any certificate and host name. For development only; the connection can be intercepted.
+      visible-if:
+        advanced-options: true
+    - name: mtls-certificate
+      display-name: Client certificate (PEM)
+      type: secret
+      secret-kind: pem-cert
+      required: false
+      helper-text: For a server that asks for a client certificate (mutual TLS). Needs the client key too.
+      visible-if:
+        advanced-options: true
+    - name: mtls-key
+      display-name: Client key (PEM)
+      type: secret
+      secret-kind: pem-cert
+      required: false
+      helper-text: The certificate's private key, unencrypted (PKCS#8, PKCS#1 RSA or SEC1 EC).
+      visible-if:
+        advanced-options: true
+    - name: mtls-sign-in
+      display-name: Sign in with the client certificate
+      type: boolean
+      default: false
+      description: The certificate is the credential. No user name, password or token is sent.
+      visible-if:
+        advanced-options: true
+    - merge:
+        - additional-options
+        - display-name: Additional JDBC options
+          placeholder: "resultPartitions=8&networkTimeout=600000"
+          helper-text: "Allowed: async, pollWait, retainResults, ipcCompression, resultBufferSize, resultPartitions, resultOrder, connectTimeout, networkTimeout, resumeTimeout, basePath, useSystemTrustStore."
+    - default-advanced-options
+init:
+  - step: load-namespace
+    namespace: metabase.driver.hardcharger
+  - step: register-jdbc-driver
+    class: com.gizmodata.hardcharger.jdbc.HardchargerDriver

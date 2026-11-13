@@ -1,0 +1,7 @@
+{:paths ["src" "resources"]
+
+ :deps
+ ;; The Hardcharger JDBC driver (Apache-2.0), the vanity layer over com.gizmodata/chargewire-jdbc,
+ ;; which it brings in: one jar with Arrow, Jackson and zstd-jni relocated or bundled inside.
+ ;; Both are bundled into the plugin jar; see NOTICE and THIRD-PARTY-NOTICES.md.
+ {com.gizmodata/hardcharger-jdbc {:mvn/version "2.4.4"}}}
