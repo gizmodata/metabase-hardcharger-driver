@@ -14,11 +14,18 @@ What it proves, in order (any failure exits non-zero; nothing is skipped):
   6. a dashboard's cards return their rows through the dashboard endpoints, and render in a browser;
   7. connection errors are readable and never contain the password;
   8. TLS with a private CA (uploaded as a secret), and sign-in with a client certificate (mutual TLS);
-  9. the additional-options allowlist refuses a dangerous option.
+  9. the additional-options allowlist refuses a dangerous option;
+ 10. CSV uploads: a file with every upload column type, appended to, replaced, widened and queried;
+ 11. table transforms: created from a query-builder question and from SQL, run, run again, and dropped;
+ 12. the same as a user without the privileges (the server's refusal reaches the user by name), as a
+     user with just the privileges needed, and uploads turned off again;
+ 13. upload dates and times with the Metabase JVM, the report time zone and the Hardcharger server in
+     three different zones each, in three combinations (a fresh Metabase per combination).
 
-It starts two Hardcharger servers on free ports (plain HTTP with the sample data, and TLS), and one
-Metabase container named after this process, and removes what it started. Metabase reaches the servers
-on the Docker host as host.docker.internal.
+It starts Hardcharger servers on free ports (plain HTTP with the sample data, TLS, one with access
+control, and one per time-zone combination), and one Metabase container at a time named after this
+process, and removes what it started. Metabase reaches the servers on the Docker host as
+host.docker.internal.
 
 Needs Docker, openssl, and the packages in e2e/requirements.txt (the `hardcharger` package downloads
 the server binary; HARDCHARGER_SERVER_BINARY names another build). `playwright install chromium` once.
@@ -209,6 +216,55 @@ def wait_for_sync(mb: Metabase, database_id: int, deadline_seconds: float = 180.
             raise Failure("the database's first sync was aborted")
         time.sleep(2)
     raise Failure(f"sync of database {database_id} did not complete within {deadline_seconds:.0f} s")
+
+
+def post_csv(mb: Metabase, path: str, filename: str, content: str, fields: dict | None = None):
+    """POST a CSV file as multipart/form-data, as the browser's upload does. Returns (status, body, headers)."""
+    boundary = "e2e" + secrets.token_hex(12)
+    parts = b""
+    for key, value in (fields or {}).items():
+        parts += f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+    parts += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+              "Content-Type: text/csv\r\n\r\n").encode() + content.encode() + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(url=mb.base_url + path, data=parts, method="POST")
+    request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    request.add_header("X-Metabase-Session", mb.session)
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            status, text, headers = response.status, response.read().decode(), dict(response.headers)
+    except urllib.error.HTTPError as error:
+        status, text, headers = error.code, error.read().decode(), dict(error.headers)
+    try:
+        body = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        body = text
+    return status, body, headers
+
+
+def upload_csv(mb: Metabase, filename: str, content: str) -> dict:
+    """Upload a CSV as a new table; returns the table Metabase made for it."""
+    status, body, headers = post_csv(mb, "/api/upload/csv", filename, content, {"collection_id": "root"})
+    if status != 200:
+        raise Failure(f"uploading {filename} answered {status}: {json.dumps(body)[:1500]}")
+    table_id = {k.lower(): v for k, v in headers.items()}.get("metabase-table-id")
+    return mb.get(f"/api/table/{table_id}")
+
+
+def native_rows(mb: Metabase, database_id: int, sql: str) -> list[list]:
+    return mb.rows({"database": database_id, "type": "native", "native": {"query": sql}})
+
+
+def run_transform(mb: Metabase, transform_id: int, deadline_seconds: float = 120.0) -> dict:
+    """Run a transform and wait for the run to end; returns its last run."""
+    before = (mb.get(f"/api/transform/{transform_id}").get("last_run") or {}).get("id")
+    mb.post(f"/api/transform/{transform_id}/run")
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        last_run = mb.get(f"/api/transform/{transform_id}").get("last_run")
+        if last_run and last_run.get("id") != before and last_run.get("status") not in ("started", "running"):
+            return last_run
+        time.sleep(1)
+    raise Failure(f"transform {transform_id} did not finish within {deadline_seconds:.0f} s")
 
 
 def uploaded(pem_path: Path) -> str:
@@ -670,6 +726,20 @@ def check_in_a_browser(mb: Metabase, password: str, dashboard_id: int, cards: di
         expect(page.get_by_text("Additional JDBC options").first).to_be_visible()
         check("and, under advanced options, the certificate fields and the additional options", True)
 
+        # Where an admin turns uploads on: the Hardcharger database and its schemas are offered there.
+        page.set_viewport_size({"width": 1300, "height": 900})
+        page.goto(f"{mb.base_url}/admin/settings/uploads")
+        page.wait_for_load_state("networkidle")
+        page.get_by_role("textbox", name="Database to use for uploads").click()
+        page.get_by_role("option", name="Hardcharger shop").click()
+        page.get_by_role("textbox", name="Schema").click()
+        expect(page.get_by_role("option", name="uploads")).to_be_visible(timeout=30_000)
+        page.get_by_role("option", name="uploads").click()
+        expect(page.get_by_role("button", name="Enable uploads")).to_be_enabled(timeout=30_000)
+        check("the uploads settings offer the Hardcharger database and its schemas", True)
+        if screenshots:
+            page.screenshot(path=str(screenshots / "uploads-settings.png"))
+
         check("the browser saw no page error and no 5xx response", not problems, problems[:5])
         browser.close()
 
@@ -784,6 +854,341 @@ def check_access_token(mb: Metabase, server: hardcharger.Server) -> None:
     check("the stored token is not returned by the API", token not in stored)
 
 
+# ---- uploads and transforms --------------------------------------------------------------------------------
+
+LONG_TEXT = "a long text, " * 30  # more than 255 characters: Metabase's "text" upload type
+
+# One column of every upload type Metabase detects, with the values that go wrong when something is
+# careless: integers beyond 2^53, text with quotes, a line break and non-Latin characters, an empty row,
+# a local time that does not exist in New York (02:30 on the day clocks go forward) and one that happens
+# twice there, and instants written with three different offsets.
+EVERY_TYPE_CSV = (
+    "id,big,ratio,flag,on_date,at_local,at_offset,label,notes\n"
+    '1,9223372036854775807,1234.5,true,2026-03-08,2026-03-08 02:30:00,2026-03-08T01:30:00-05:00,'
+    '"Ann ""A"" O\'Neil","' + LONG_TEXT + '"\n'
+    '2,-9007199254740993,-0.25,false,2026-11-01,2026-11-01 01:30:00,2026-07-01T12:00:00+05:30,'
+    '"line one\nline two",short\n'
+    "3,0,0.0,true,2024-02-29,2024-02-29 23:59:59,2026-01-15T23:59:59Z,日本語 🦆 ñ,\n"
+    "4,,,,,,,,\n"
+)
+EVERY_TYPE_COLUMNS = [
+    ["id", "BIGINT"], ["big", "BIGINT"], ["ratio", "DOUBLE"], ["flag", "BOOLEAN"], ["on_date", "DATE"],
+    ["at_local", "TIMESTAMP"], ["at_offset", "TIMESTAMP WITH TIME ZONE"], ["label", "VARCHAR"], ["notes", "VARCHAR"],
+]
+# What the server must hold, read back in forms no time zone can change: whole numbers and dates as text,
+# local times as written, instants as seconds since 1970.
+EVERY_TYPE_ROWS = [
+    [1, "9223372036854775807", 1234.5, True, "2026-03-08", "2026-03-08 02:30:00",
+     int(dt.datetime(2026, 3, 8, 6, 30, tzinfo=dt.timezone.utc).timestamp()), 'Ann "A" O\'Neil', LONG_TEXT],
+    [2, "-9007199254740993", -0.25, False, "2026-11-01", "2026-11-01 01:30:00",
+     int(dt.datetime(2026, 7, 1, 6, 30, tzinfo=dt.timezone.utc).timestamp()), "line one\nline two", "short"],
+    [3, "0", 0.0, True, "2024-02-29", "2024-02-29 23:59:59",
+     int(dt.datetime(2026, 1, 15, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp()), "日本語 🦆 ñ", None],
+    [4, None, None, None, None, None, None, None, None],
+]
+READ_BACK = ("SELECT id, CAST(big AS VARCHAR), ratio, flag, CAST(on_date AS VARCHAR), "
+             "strftime(at_local, '%Y-%m-%d %H:%M:%S'), CAST(epoch(at_offset) AS BIGINT), label, notes "
+             'FROM uploads."{table}" ORDER BY id')
+
+
+def columns_on_server(mb: Metabase, database_id: int, table_name: str) -> list[list]:
+    return native_rows(mb, database_id,
+                       "SELECT column_name, data_type FROM duckdb_columns() WHERE schema_name = 'uploads' "
+                       f"AND table_name = '{table_name}' ORDER BY column_index")
+
+
+def read_back(mb: Metabase, database_id: int, table_name: str) -> list[list]:
+    rows = native_rows(mb, database_id, READ_BACK.format(table=table_name))
+    return [[None if v is None else (float(v) if i == 2 else v) for i, v in enumerate(row)] for row in rows]
+
+
+def check_uploads(mb: Metabase, database_id: int) -> None:
+    print("10. CSV uploads")
+    schemas = mb.get(f"/api/database/{database_id}/syncable_schemas")
+    check("the schemas offered for uploads are this catalog's own", sorted(schemas) == ["main", "shop", "uploads"],
+          schemas)
+    mb.put("/api/setting/uploads-settings",
+           {"value": {"db_id": database_id, "schema_name": "uploads", "table_prefix": "up_"}})
+
+    table = upload_csv(mb, "every type.csv", EVERY_TYPE_CSV)
+    name = table["name"]
+    check("the upload made a table in the chosen schema, with the prefix",
+          table["schema"] == "uploads" and name.startswith("up_every_type_") and table.get("is_upload") is True,
+          (table["schema"], name, table.get("is_upload")))
+    check("each column has the DuckDB type of its upload type",
+          columns_on_server(mb, database_id, name) == EVERY_TYPE_COLUMNS, columns_on_server(mb, database_id, name))
+    check("every value is stored exactly (big integers, quotes, line breaks, Unicode, empty cells)",
+          read_back(mb, database_id, name) == EVERY_TYPE_ROWS, read_back(mb, database_id, name))
+    fields = {f["name"]: f for f in mb.get(f"/api/table/{table['id']}/query_metadata")["fields"]}
+    check("Metabase synced the new table's columns",
+          {n: f["base_type"] for n, f in fields.items()} == {
+              "id": "type/BigInteger", "big": "type/BigInteger", "ratio": "type/Float", "flag": "type/Boolean",
+              "on_date": "type/Date", "at_local": "type/DateTime", "at_offset": "type/DateTimeWithLocalTZ",
+              "label": "type/Text", "notes": "type/Text"},
+          {n: f["base_type"] for n, f in fields.items()})
+    rows = mb.rows({"database": database_id, "type": "query",
+                    "query": {"source-table": table["id"], "aggregation": [["count"]],
+                              "filter": ["=", ["field", fields["flag"]["id"], None], True]}})
+    check("the uploaded table answers a query-builder question", rows == [[2]], rows)
+
+    status, body, _ = post_csv(mb, f"/api/table/{table['id']}/append-csv", "more.csv",
+                               "id,big,ratio,flag,on_date,at_local,at_offset,label,notes\n"
+                               "5,5,5.5,false,2027-01-01,2027-01-01 00:00:00,2027-01-01T00:00:00+09:00,five,\n")
+    check("appending a file adds its rows", status in (200, 204), (status, body))
+    appended = read_back(mb, database_id, name)
+    check("the table holds the old rows and the new one",
+          appended[:4] == EVERY_TYPE_ROWS and appended[4] == [
+              5, "5", 5.5, False, "2027-01-01", "2027-01-01 00:00:00",
+              int(dt.datetime(2026, 12, 31, 15, 0, tzinfo=dt.timezone.utc).timestamp()), "five", None],
+          appended[4:])
+
+    status, body, _ = post_csv(mb, f"/api/table/{table['id']}/replace-csv", "new.csv",
+                               "id,big,ratio,flag,on_date,at_local,at_offset,label,notes\n"
+                               "9,9,9.0,true,2028-01-01,2028-01-01 09:09:09,2028-01-01T09:09:09Z,nine,n\n")
+    check("replacing with a file swaps the rows", status in (200, 204), (status, body))
+    check("only the new file's rows are left",
+          read_back(mb, database_id, name) == [[
+              9, "9", 9.0, True, "2028-01-01", "2028-01-01 09:09:09",
+              int(dt.datetime(2028, 1, 1, 9, 9, 9, tzinfo=dt.timezone.utc).timestamp()), "nine", "n"]],
+          read_back(mb, database_id, name))
+
+    # a later file may widen a column, and bring a new one
+    widening = upload_csv(mb, "widening.csv", "n,flag\n1,true\n2,false\n")
+    status, body, _ = post_csv(mb, f"/api/table/{widening['id']}/append-csv", "wider.csv", "n,flag,extra\n2.5,7,hello\n")
+    check("appending wider values is accepted", status in (200, 204), (status, body))
+    check("the whole-number column became DOUBLE, the boolean BIGINT, and the new column was added",
+          columns_on_server(mb, database_id, widening["name"]) == [["n", "DOUBLE"], ["flag", "BIGINT"], ["extra", "VARCHAR"]],
+          columns_on_server(mb, database_id, widening["name"]))
+    rows = native_rows(mb, database_id, f'SELECT n, flag, extra FROM uploads."{widening["name"]}" ORDER BY n')
+    check("with the old values converted, not lost", rows == [[1.0, 1, None], [2.0, 0, None], [2.5, 7, "hello"]], rows)
+
+    status, body, _ = post_csv(mb, f"/api/table/{widening['id']}/append-csv", "bad.csv", "n,flag,extra\nnot a number,1,x\n")
+    check("a file that does not fit the table is refused, in words",
+          status == 422 and "n" in json.dumps(body), (status, body))
+    rows = native_rows(mb, database_id, f'SELECT count(*) FROM uploads."{widening["name"]}"')
+    check("and leaves the table as it was", rows == [[3]], rows)
+
+
+def check_transforms(mb: Metabase, database_id: int, tables: dict, fields: dict) -> None:
+    print("11. table transforms")
+    mb.put("/api/setting/transforms-enabled", {"value": True})
+
+    def tables_in(schema: str) -> list[str]:
+        return [r[0] for r in native_rows(mb, database_id,
+                                          "SELECT table_name FROM information_schema.tables WHERE table_catalog = "
+                                          f"current_database() AND table_schema = '{schema}' ORDER BY 1")]
+
+    by_status = mb.post("/api/transform", {
+        "name": "Orders by status",
+        "source": {"type": "query", "query": {"database": database_id, "type": "query", "query": {
+            "source-table": tables["orders"], "aggregation": [["count"]],
+            "breakout": [["field", fields["orders.status"], None]]}}},
+        # a schema that does not exist yet: the transform creates it
+        "target": {"type": "table", "schema": "analytics", "name": "orders_by_status"},
+    })
+    last_run = run_transform(mb, by_status["id"])
+    check("a transform from a query-builder question runs", last_run["status"] == "succeeded", last_run)
+    rows = native_rows(mb, database_id, "SELECT status, count FROM analytics.orders_by_status ORDER BY status")
+    check("its table has the query's rows", rows == [[s, 250] for s in sorted(STATUSES)], rows)
+
+    doubled = mb.post("/api/transform", {
+        "name": "Doubled",
+        "source": {"type": "query", "query": {"database": database_id, "type": "native", "native": {
+            "query": "SELECT status, count * 2 AS doubled FROM analytics.orders_by_status"}}},
+        "target": {"type": "table", "schema": "analytics", "name": "orders_doubled"},
+    })
+    dependencies = [d["id"] for d in mb.get(f"/api/transform/{doubled['id']}/dependencies")]
+    check("Metabase reads a SQL transform's tables out of its SQL (parsed as DuckDB)",
+          dependencies == [by_status["id"]], dependencies)
+    last_run = run_transform(mb, doubled["id"])
+    check("a transform from SQL runs", last_run["status"] == "succeeded", last_run)
+    rows = native_rows(mb, database_id, "SELECT status, doubled FROM analytics.orders_doubled ORDER BY status")
+    check("its table has the query's rows too", rows == [[s, 500] for s in sorted(STATUSES)], rows)
+
+    last_run = run_transform(mb, by_status["id"])
+    check("running a transform again replaces its table", last_run["status"] == "succeeded", last_run)
+    rows = native_rows(mb, database_id, "SELECT count(*), sum(count) FROM analytics.orders_by_status")
+    check("with the same rows, not twice", [[int(v) for v in rows[0]]] == [[4, 1000]], rows)
+    check("and leaves no temporary table behind", tables_in("analytics") == ["orders_by_status", "orders_doubled"],
+          tables_in("analytics"))
+
+    deadline = time.monotonic() + 60
+    synced = None
+    while time.monotonic() < deadline and not synced:
+        synced = (mb.get(f"/api/transform/{by_status['id']}").get("table") or {}).get("id")
+        time.sleep(1)
+    check("Metabase synced the transform's table", bool(synced), synced)
+    rows = mb.rows({"database": database_id, "type": "query",
+                    "query": {"source-table": synced, "aggregation": [["count"]]}})
+    check("which answers a query-builder question", rows == [[4]], rows)
+
+    failing = mb.post("/api/transform", {
+        "name": "Failing",
+        "source": {"type": "query", "query": {"database": database_id, "type": "native", "native": {
+            "query": "SELECT * FROM analytics.no_such_table"}}},
+        "target": {"type": "table", "schema": "analytics", "name": "never_made"},
+    })
+    last_run = run_transform(mb, failing["id"])
+    check("a transform whose SQL fails says why, in the server's words",
+          last_run["status"] == "failed" and "no_such_table" in str(last_run.get("message")), last_run)
+    check("and makes no table", "never_made" not in tables_in("analytics"), tables_in("analytics"))
+
+    mb.call("DELETE", f"/api/transform/{doubled['id']}/table", ok=(200, 204))
+    check("deleting a transform's table drops it on the server", tables_in("analytics") == ["orders_by_status"],
+          tables_in("analytics"))
+    for transform in (doubled, failing, by_status):
+        if transform is by_status:
+            mb.call("DELETE", f"/api/transform/{transform['id']}/table", ok=(200, 204))
+        mb.call("DELETE", f"/api/transform/{transform['id']}", ok=(200, 204))
+    check("and nothing of the transforms is left", tables_in("analytics") == [], tables_in("analytics"))
+
+
+def check_privileges(mb: Metabase, acl_server: hardcharger.Server, viewer_password: str, uploader_password: str) -> None:
+    print("12. without the privileges, and with just enough")
+
+    def add(name: str, user: str, password: str) -> int:
+        database = mb.post("/api/database", {
+            "engine": "hardcharger", "name": name,
+            "details": {"host": DOCKER_HOST_NAME, "port": acl_server.port, "tls": False, "use-token": False,
+                        "user": user, "password": password, "catalog": "memory"}})
+        wait_for_sync(mb, database["id"])
+        return database["id"]
+
+    viewer_db = add("Hardcharger as a viewer", "viewer", viewer_password)
+    metadata = mb.get(f"/api/database/{viewer_db}/metadata?include_hidden=true")
+    schemas = sorted({t["schema"] for t in metadata["tables"]})
+    check("a read-only user's sync sees the tables it may read", schemas == ["shop"], schemas)
+    rows = native_rows(mb, viewer_db, "SELECT HARDCHARGER_USER(), count(*) FROM shop.orders")
+    check("and it can query them", rows == [["viewer", ORDER_COUNT]], rows)
+
+    mb.put("/api/setting/uploads-settings", {"value": {"db_id": viewer_db, "schema_name": "uploads", "table_prefix": None}})
+    status, body, _ = post_csv(mb, "/api/upload/csv", "refused.csv", "a,b\n1,2\n", {"collection_id": "root"})
+    text = json.dumps(body)
+    check("an upload without CREATE TABLE is refused with the server's reason",
+          status >= 400 and "user viewer has no CREATE TABLE privilege on schema memory.uploads" in text,
+          (status, text[:800]))
+    check("the refusal contains no password", viewer_password not in text and acl_server.password not in text)
+    rows = native_rows(mb, viewer_db, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'uploads'")
+    check("and nothing was created", rows == [[0]], rows)
+
+    for target_schema, wanted in [("uploads", "user viewer has no CREATE TABLE privilege on schema memory.uploads"),
+                                  ("brand_new", "user viewer has no CREATE SCHEMA privilege on catalog memory")]:
+        transform = mb.post("/api/transform", {
+            "name": f"Refused into {target_schema}",
+            "source": {"type": "query", "query": {"database": viewer_db, "type": "native", "native": {
+                "query": "SELECT status, count(*) AS n FROM shop.orders GROUP BY status"}}},
+            "target": {"type": "table", "schema": target_schema, "name": "refused"},
+        })
+        last_run = run_transform(mb, transform["id"])
+        check(f"a transform into {target_schema} without the privilege fails with the server's reason",
+              last_run["status"] == "failed" and wanted in str(last_run.get("message")), last_run)
+        mb.call("DELETE", f"/api/transform/{transform['id']}", ok=(200, 204))
+
+    uploader_db = add("Hardcharger as an uploader", "uploader", uploader_password)
+    mb.put("/api/setting/uploads-settings", {"value": {"db_id": uploader_db, "schema_name": "uploads", "table_prefix": None}})
+    table = upload_csv(mb, "allowed.csv", "a,b\n1,x\n2,y\n")
+    rows = native_rows(mb, uploader_db, f'SELECT a, b FROM uploads."{table["name"]}" ORDER BY a')
+    check("with ALL PRIVILEGES on the uploads schema, and nothing else to write to, an upload works",
+          rows == [[1, "x"], [2, "y"]], rows)
+    status, body, _ = post_csv(mb, f"/api/table/{table['id']}/append-csv", "more.csv", "a,b\n3,z\n")
+    check("and so does an append", status in (200, 204), (status, body))
+    transform = mb.post("/api/transform", {
+        "name": "Allowed",
+        "source": {"type": "query", "query": {"database": uploader_db, "type": "native", "native": {
+            "query": "SELECT status, count(*) AS n FROM shop.orders GROUP BY status"}}},
+        "target": {"type": "table", "schema": "uploads", "name": "orders_by_status"},
+    })
+    for attempt in ("first", "second"):
+        last_run = run_transform(mb, transform["id"])
+        check(f"and a transform into that schema, {attempt} run", last_run["status"] == "succeeded", last_run)
+    rows = native_rows(mb, uploader_db, "SELECT count(*), sum(n) FROM uploads.orders_by_status")
+    check("whose table is right", [[int(v) for v in rows[0]]] == [[4, ORDER_COUNT]], rows)
+    mb.call("DELETE", f"/api/transform/{transform['id']}/table", ok=(200, 204))
+    mb.call("DELETE", f"/api/transform/{transform['id']}", ok=(200, 204))
+
+    mb.put("/api/setting/uploads-settings", {"value": {"db_id": None, "schema_name": None, "table_prefix": None}})
+    check("uploads can be turned off again", mb.get("/api/setting/uploads-settings").get("db_id") is None,
+          mb.get("/api/setting/uploads-settings"))
+    status, body, _ = post_csv(mb, "/api/upload/csv", "off.csv", "a\n1\n", {"collection_id": "root"})
+    check("and then an upload is refused", status >= 400, (status, body))
+
+
+# Three combinations in which the Metabase JVM, the Hardcharger server and Metabase's report time zone
+# are all different, and every zone takes each role once. If any of the three leaked into how an upload's
+# dates and times are stored, at least one combination would store something else.
+ZONE_COMBINATIONS = [
+    # (Metabase JVM, Hardcharger server, report time zone)
+    ("UTC", "America/New_York", "Asia/Kolkata"),
+    ("America/New_York", "Asia/Kolkata", "UTC"),
+    ("Asia/Kolkata", "UTC", "America/New_York"),
+]
+
+
+def check_upload_zones(start_metabase, stop_metabase, binary: str | None, work: Path, admin_password: str) -> None:
+    print("13. upload dates and times, in three combinations of zones")
+    for jvm_zone, server_zone, report_zone in ZONE_COMBINATIONS:
+        label = f"JVM {jvm_zone}, server {server_zone}, report {report_zone}"
+        log = work / f"hardcharger-{server_zone.replace('/', '_')}.log"
+        server = hardcharger.Server(
+            host="0.0.0.0", binary=binary, log_file=log, env={"TZ": server_zone},
+            extra_args=["--init-sql-commands", "CREATE SCHEMA uploads", "--no-web-ui"])
+        server.start()
+        try:
+            mb = start_metabase(["-e", f"JAVA_TIMEZONE={jvm_zone}"])
+            mb.set_up(password=admin_password)
+            details = mb.get("/api/bug-reporting/details")
+            actual_jvm_zone = details.get("system-info", {}).get("user.timezone")
+            check(f"[{label}] the Metabase JVM runs in its zone", actual_jvm_zone == jvm_zone, actual_jvm_zone)
+            database = mb.post("/api/database", {
+                "engine": "hardcharger", "name": "Hardcharger zones",
+                "details": database_details(server, catalog="memory")})
+            synced = wait_for_sync(mb, database["id"])
+            check(f"[{label}] the server runs in its zone", synced.get("timezone") == server_zone, synced.get("timezone"))
+            mb.put("/api/setting/report-timezone", {"value": report_zone})
+            rows = native_rows(mb, database["id"], "SELECT current_setting('TimeZone')")
+            check(f"[{label}] the session runs in the report zone", rows == [[report_zone]], rows)
+
+            mb.put("/api/setting/uploads-settings",
+                   {"value": {"db_id": database["id"], "schema_name": "uploads", "table_prefix": None}})
+            table = upload_csv(mb, "every type.csv", EVERY_TYPE_CSV)
+            check(f"[{label}] column types", columns_on_server(mb, database["id"], table["name"]) == EVERY_TYPE_COLUMNS,
+                  columns_on_server(mb, database["id"], table["name"]))
+            stored = read_back(mb, database["id"], table["name"])
+            check(f"[{label}] dates, local times and instants are stored as written",
+                  stored == EVERY_TYPE_ROWS, [(a, b) for a, b in zip(stored, EVERY_TYPE_ROWS) if a != b])
+
+            status, body, _ = post_csv(mb, f"/api/table/{table['id']}/append-csv", "more.csv",
+                                       "id,big,ratio,flag,on_date,at_local,at_offset,label,notes\n"
+                                       "5,5,5.5,false,2026-03-08,2026-03-08 02:30:00,2026-03-08T02:30:00+05:30,five,\n")
+            check(f"[{label}] an append is accepted", status in (200, 204), (status, body))
+            stored = read_back(mb, database["id"], table["name"])
+            check(f"[{label}] and stored as written too",
+                  stored[4] == [5, "5", 5.5, False, "2026-03-08", "2026-03-08 02:30:00",
+                                int(dt.datetime(2026, 3, 7, 21, 0, tzinfo=dt.timezone.utc).timestamp()), "five", None],
+                  stored[4])
+
+            # and read back through the query builder, where the report zone decides how an instant is shown
+            fields = {f["name"]: f["id"] for f in mb.get(f"/api/table/{table['id']}/query_metadata")["fields"]}
+            rows = mb.rows({"database": database["id"], "type": "query", "query": {
+                "source-table": table["id"],
+                "fields": [["field", fields[n], None] for n in ("id", "on_date", "at_local", "at_offset")],
+                "filter": ["<=", ["field", fields["id"], None], 3],
+                "order-by": [["asc", ["field", fields["id"], None]]]}})
+            zone = ZoneInfo(report_zone)
+            shown_right = True
+            for row, expected in zip(rows, EVERY_TYPE_ROWS):
+                instant = dt.datetime.fromisoformat(row[3].replace("Z", "+00:00"))
+                wanted = dt.datetime.fromtimestamp(expected[6], tz=dt.timezone.utc)
+                shown_right = (shown_right and row[1][:10] == expected[4]
+                               and row[2][:19].replace("T", " ") == expected[5]
+                               and instant == wanted and instant.utcoffset() == wanted.astimezone(zone).utcoffset())
+            check(f"[{label}] the query builder shows dates and local times as written, and instants in the report zone",
+                  shown_right and len(rows) == 3, rows)
+        finally:
+            stop_metabase()
+            server.stop(keep_log=True)
+
+
 # ---- main ---------------------------------------------------------------------------------------------
 
 
@@ -792,7 +1197,8 @@ def main() -> int:
     parser.add_argument("--jar", required=True, type=Path, help="the driver plugin jar to test")
     parser.add_argument("--metabase-image", default=os.environ.get("METABASE_IMAGE", DEFAULT_IMAGE))
     parser.add_argument("--screenshots", type=Path, help="directory to write the README's screenshots to")
-    parser.add_argument("--keep", action="store_true", help="leave Metabase and the servers running at the end")
+    parser.add_argument("--keep", action="store_true",
+                        help="after the main checks, leave Metabase and the servers running until interrupted")
     parser.add_argument("--no-browser", action="store_true", help="skip the browser step (not for the release gate)")
     parser.add_argument("--java-opts", help="JAVA_OPTS for Metabase (the default is none, as the README promises)")
     args = parser.parse_args()
@@ -815,13 +1221,41 @@ def main() -> int:
     os.chmod(work, 0o755)
     os.chmod(plugins, 0o777)  # the container's user writes the bundled drivers here too
     certificates = make_certificates(work)
-    server_log, tls_log = work / "hardcharger.log", work / "hardcharger-tls.log"
+    server_log, tls_log, acl_log = work / "hardcharger.log", work / "hardcharger-tls.log", work / "hardcharger-acl.log"
     container = f"mbhc-e2e-{os.getpid()}"
-    metabase_port = free_port()
     admin_password = "Aa1!" + secrets.token_urlsafe(18)
+    viewer_password, uploader_password = secrets.token_urlsafe(18), secrets.token_urlsafe(18)
     binary = os.environ.get("HARDCHARGER_SERVER_BINARY")
-    started_container = False
+    running = {"container": False}
     failed = True
+
+    def start_metabase(extra: list[str]) -> Metabase:
+        """One Metabase container at a time, always under the same name."""
+        port = free_port()
+        run([
+            "docker", "run", "-d", "--name", container,
+            "--add-host", f"{DOCKER_HOST_NAME}:host-gateway",
+            "-p", f"127.0.0.1:{port}:3000",
+            "-v", f"{plugins}:/plugins",
+            "-e", "MB_PLUGINS_DIR=/plugins",
+            # No JAVA_OPTS: the README says the driver needs none.
+            "-e", "MB_CHECK_FOR_UPDATES=false", "-e", "MB_ANON_TRACKING_ENABLED=false",
+            *extra,
+            args.metabase_image,
+        ])
+        running["container"] = True
+        metabase = Metabase(base_url=f"http://127.0.0.1:{port}")
+        metabase.wait_healthy(deadline_seconds=600, container=container)
+        return metabase
+
+    def metabase_log() -> str:
+        logs = subprocess.run(args=["docker", "logs", container], capture_output=True, text=True)
+        return logs.stdout + logs.stderr
+
+    def stop_metabase() -> None:
+        if running["container"]:
+            subprocess.run(args=["docker", "rm", "-f", container], capture_output=True)
+            running["container"] = False
 
     # 0.0.0.0: the Metabase container reaches the servers through the Docker host's gateway address.
     server = hardcharger.Server(
@@ -836,24 +1270,23 @@ def main() -> int:
         extra_args=["--no-web-ui", "--mtls-ca-cert", str(certificates["ca"]), "--no-mtls-require-client-cert",
                     "--mtls-certificate-sign-in", "--mtls-admin-identities", "metabase@example.invalid"],
     )
-    mb = Metabase(base_url=f"http://127.0.0.1:{metabase_port}")
+    # The same data under access control (users, roles and grants in a DuckDB file of the server's own).
+    acl_sql = work / "seed-with-access-control.sql"
+    acl_sql.write_text((HERE / "seed.sql").read_text() + "\n" + (HERE / "access-control.sql").read_text().format(
+        viewer_password=viewer_password, uploader_password=uploader_password))
+    acl_server = hardcharger.Server(
+        host="0.0.0.0", binary=binary, log_file=acl_log, env={"TZ": "UTC"},
+        extra_args=["--init-sql-commands-file", str(acl_sql), "--no-web-ui",
+                    "--rbac-store-uri", f"duckdb:{work / 'access-control.duckdb'}"],
+    )
+    servers = [server, tls_server, acl_server]
+    mb = None
     try:
-        server.start()
-        tls_server.start()
-        print(f"Hardcharger on :{server.port} (plain) and :{tls_server.port} (TLS); starting {args.metabase_image}")
-        run([
-            "docker", "run", "-d", "--name", container,
-            "--add-host", f"{DOCKER_HOST_NAME}:host-gateway",
-            "-p", f"127.0.0.1:{metabase_port}:3000",
-            "-v", f"{plugins}:/plugins",
-            "-e", "MB_PLUGINS_DIR=/plugins",
-            # No JAVA_OPTS: the README says the driver needs none.
-            "-e", "MB_CHECK_FOR_UPDATES=false", "-e", "MB_ANON_TRACKING_ENABLED=false",
-            *(["-e", f"JAVA_OPTS={args.java_opts}"] if args.java_opts else []),
-            args.metabase_image,
-        ])
-        started_container = True
-        mb.wait_healthy(deadline_seconds=600, container=container)
+        for each in servers:
+            each.start()
+        print(f"Hardcharger on :{server.port} (plain), :{tls_server.port} (TLS) and :{acl_server.port} "
+              f"(access control); starting {args.metabase_image}")
+        mb = start_metabase(["-e", f"JAVA_OPTS={args.java_opts}"] if args.java_opts else [])
         version = mb.get("/api/session/properties")["version"]
         print(f"Metabase {version.get('tag')} is up on {mb.base_url}")
         mb.set_up(password=admin_password)
@@ -872,26 +1305,47 @@ def main() -> int:
         check_allowed_option(mb, server)
         check_tls(mb, tls_server, certificates)
         check_access_token(mb, server)
+        check_uploads(mb, database_id)
+        check_transforms(mb, database_id, tables, fields)
+        check_privileges(mb, acl_server, viewer_password, uploader_password)
 
-        logs = subprocess.run(args=["docker", "logs", container], capture_output=True, text=True)
-        log_text = logs.stdout + logs.stderr
-        for secret_value, what in [(server.password, "the database password"), (tls_server.password, "the TLS server's password")]:
+        log_text = metabase_log()
+        secrets_used = [(server.password, "the database password"), (tls_server.password, "the TLS server's password"),
+                        (acl_server.password, "the access-controlled server's password"),
+                        (viewer_password, "the viewer's password"), (uploader_password, "the uploader's password")]
+        for secret_value, what in secrets_used:
             check(f"Metabase's log does not contain {what}", secret_value not in log_text)
         check("the driver ran without a JVM option: no class-loading or native-library error in Metabase's log",
               "InaccessibleObjectException" not in log_text and "UnsatisfiedLinkError" not in log_text
               and "NoClassDefFoundError" not in log_text,
               [line for line in log_text.splitlines()
                if "Inaccessible" in line or "LinkError" in line or "NoClassDef" in line][:5])
+        check("Metabase was told to parse this driver's SQL as DuckDB's",
+              "Could not tell Metabase to parse Hardcharger" not in log_text and "Unknown dialect" not in log_text,
+              [line for line in log_text.splitlines() if "dialect" in line.lower()][:5])
         if args.java_opts and "--sun-misc-unsafe-memory-access=allow" in args.java_opts:
             check("with --sun-misc-unsafe-memory-access=allow the JVM prints no sun.misc.Unsafe warning",
                   "sun.misc.Unsafe" not in log_text)
         elif "sun.misc.Unsafe" in log_text:
             # JDK 24+ prints this once for Arrow's memory access; it is a warning, and the README says so.
             print("  note: the JVM printed its one-time sun.misc.Unsafe warning (Arrow, in the JDBC driver)")
-        for log_path in (server_log, tls_log):
+        for log_path in (server_log, tls_log, acl_log):
+            text = log_path.read_text(errors="replace")
             check(f"{log_path.name} does not contain a password",
-                  server.password not in log_path.read_text(errors="replace")
-                  and tls_server.password not in log_path.read_text(errors="replace"))
+                  all(secret_value not in text for secret_value, _ in secrets_used))
+
+        if args.keep:
+            print(f"left running: container {container} on {mb.base_url} (admin {ADMIN_EMAIL} / {admin_password}), "
+                  f"Hardcharger on :{server.port} (password {server.password}), :{tls_server.port} and "
+                  f":{acl_server.port}; files in {work}. Interrupt (Ctrl-C) to go on.", flush=True)
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+        stop_metabase()
+
+        check_upload_zones(start_metabase, stop_metabase, binary, work, admin_password)
 
         failed = False
         print(f"\nPASSED: {len(PASSED)} checks against Metabase {version.get('tag')} and Hardcharger "
@@ -903,23 +1357,16 @@ def main() -> int:
         print(f"\nFAILED after {len(PASSED)} checks: {failure}", file=sys.stderr)
         return 1
     finally:
-        if failed and started_container:
-            logs = subprocess.run(args=["docker", "logs", "--tail", "120", container], capture_output=True, text=True)
+        if failed and running["container"]:
             print("---- last Metabase log lines ----", file=sys.stderr)
-            print((logs.stdout + logs.stderr)[-12000:], file=sys.stderr)
-            for log_path in (server_log, tls_log):
-                if log_path.exists():
-                    print(f"---- {log_path.name} (tail) ----", file=sys.stderr)
-                    print("\n".join(log_path.read_text(errors="replace").splitlines()[-25:]), file=sys.stderr)
-        if args.keep:
-            print(f"left running: container {container} on {mb.base_url} (admin {ADMIN_EMAIL} / {admin_password}), "
-                  f"servers pid {server.pid} and {tls_server.pid}; files in {work}")
-        else:
-            if started_container:
-                subprocess.run(args=["docker", "rm", "-f", container], capture_output=True)
-            tls_server.stop(keep_log=True)
-            server.stop(keep_log=True)
-            shutil.rmtree(work, ignore_errors=True)
+            print(metabase_log()[-12000:], file=sys.stderr)
+            for log_path in sorted(work.glob("hardcharger*.log")):
+                print(f"---- {log_path.name} (tail) ----", file=sys.stderr)
+                print("\n".join(log_path.read_text(errors="replace").splitlines()[-25:]), file=sys.stderr)
+        stop_metabase()
+        for each in reversed(servers):
+            each.stop(keep_log=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

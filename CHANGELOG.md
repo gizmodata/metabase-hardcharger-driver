@@ -31,6 +31,16 @@ It needs Metabase 0.65.
   functions, date arithmetic and differences, time zone conversion, binning, cumulative and offset
   window functions, and pivot tables in one `GROUPING SETS` statement.
 - Native SQL with variables and field filters.
+- CSV uploads: a file becomes a table in the schema an admin chose, with `BIGINT`, `DOUBLE`, `BOOLEAN`,
+  `DATE`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` and `VARCHAR` columns; append, replace, widening a column
+  and adding columns on append. What is stored does not depend on the time zone of Metabase's JVM, the
+  report time zone or the server's.
+- Table transforms, from a query-builder question or from SQL: the target schema is created when it is
+  missing, a re-run replaces the table in one transaction, and Metabase reads a SQL transform's
+  dependencies from its SQL, parsed as DuckDB's.
+- Uploads and transforms are always available for a Hardcharger database, with no switch in the
+  connection form: Metabase keeps uploads off until an admin picks a database and schema for them, and a
+  user without the privilege gets the server's refusal by name.
 - Metabase's report time zone is the session's `TimeZone`: day and week buckets, filters on a day
   and values with a time zone all follow it.
 - Cancelling a question cancels its statement on the server; Metabase's query timeout is sent with
@@ -40,6 +50,6 @@ It needs Metabase 0.65.
 
 ### Not supported
 
-Declared unsupported, so Metabase hides them instead of failing: CSV uploads, actions and table
-editing, model persistence, transforms, connection impersonation, database routing, unfolding of
-JSON columns, and dependency tracking of native SQL. The README says why for each.
+Declared unsupported, so Metabase hides them instead of failing: actions and table editing, model
+persistence, Python transforms and transform tests, a row-id column on uploaded tables, connection
+impersonation, database routing, and unfolding of JSON columns. The README says why for each.

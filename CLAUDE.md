@@ -49,9 +49,17 @@ repository in as `modules/drivers/hardcharger` and registers it (`ci/patch-metab
    (`(lib.metadata/database (mt/metadata-provider))`, `(mt/id)`).
 5. **A feature that isn't proven by Metabase's own tests stays declared false.** Metabase hides what a driver
    says it can't do; it fails in front of the user for what a driver wrongly says it can.
+   Uploads and table transforms are on, for every connection (Metabase keeps uploads off until an admin
+   picks a database and schema; the server refuses a user without the grant, by name). Actions, table
+   editing, model persistence and Python transforms are off.
 6. **Every opt-out from Metabase's suite is in `test/metabase/test/data/hardcharger.clj` with its reason**, and
    in the README. Don't add one without a Hardcharger, DuckDB or JDBC limitation behind it.
-7. **A JDBC driver gap is reported upstream** (chargewire-jdbc first, then hardcharger-jdbc) with a repro; a
+   Two tests are ignored by name in `ci/run-metabase-tests.sh` (they need Metabase's `enterprise/` code).
+7. **The driver wraps one Metabase-internal function** (`metabase.sql-tools.sqlglot.core/driver->dialect`)
+   so Metabase parses Hardcharger's SQL as DuckDB's; without it transforms cannot be ordered by their SQL.
+   The end-to-end check fails if the wrap stops working. Remove it when Metabase lets a driver name its
+   dialect.
+8. **A JDBC driver gap is reported upstream** (chargewire-jdbc first, then hardcharger-jdbc) with a repro; a
    workaround here names the JDBC version in a comment so it can be removed.
 
 ## Releasing

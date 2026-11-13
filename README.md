@@ -95,7 +95,8 @@ its server, where nobody could complete it.
 
 **Writes.** Metabase marks the connections its questions use read-only, which the JDBC driver takes as a
 hint: Hardcharger decides who may write by user and role, or for the whole server with `--read-only`. To
-be sure a native SQL question cannot change data, connect Metabase as a user that may only read.
+be sure a native SQL question cannot change data, connect Metabase as a user that may only read. For
+[uploads and transforms](#uploads-and-transforms) that user needs the privileges listed there.
 
 **GizmoData Cloud clusters that stop when idle.** Metabase's connection pool never starts a stopped
 cluster, but its scheduled sync and scans do, like any query (by default every hour). To let a cluster
@@ -117,6 +118,8 @@ frequent schedule.
 | Window functions | Cumulative aggregations and offsets (`LAG`/`LEAD`) |
 | Pivot tables | One statement with `GROUPING SETS` |
 | Native SQL | Variables (text, number, date), field filters, snippets, questions and tables as `{{references}}` |
+| CSV uploads | A file becomes a table in the schema an admin chose: create, append, replace; see [Uploads and transforms](#uploads-and-transforms) |
+| Transforms | Table transforms from a query-builder question or from SQL: created, run, run again, on a schedule, with their dependencies read from the SQL |
 | Report time zone | Metabase's report time zone is the session's `TimeZone`: buckets, filters on a day, and values with a time zone follow it. Without one, the session runs in the server's zone |
 | Cancel and time limit | Cancelling a question cancels its statement on the server; Metabase's query timeout travels with each statement |
 
@@ -126,12 +129,74 @@ Metabase hides these for a Hardcharger database instead of offering them and fai
 
 | Feature | Why |
 |---|---|
-| CSV uploads, actions, editing table data, model persistence, transforms | The writing features. Each needs DDL and error handling proven against Metabase's own tests before it is offered; none is implemented yet |
+| Actions, editing table data, model persistence, Python transforms, transform tests | The other writing features. Each needs its own DDL and error handling proven against Metabase's tests before it is offered; none is implemented |
+| A row-id column on uploaded tables | DuckDB has no auto-incrementing column type, so an uploaded table has the file's columns and no `_mb_row_id` |
 | Connection impersonation, database routing | Metabase Enterprise features that switch role or connection per user; not implemented |
 | Unfolding JSON columns into fields | JSON columns sync as one column and show as text. Use `->>` in a custom SQL question, or a view |
-| Dependency tracking of native SQL | Metabase parses SQL with a dialect it picks from a fixed list of its own drivers, which a community driver cannot extend |
 | Lookaheads and lookbehinds in regular expressions | DuckDB's regular expressions are RE2 |
 | Index information | DuckDB's ART indexes do not make a column worth flagging |
+
+## Uploads and transforms
+
+Both write to the server as the user the connection signs in as, so that user needs the privileges, and
+nothing happens until an admin turns each on in Metabase.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/gizmodata/metabase-hardcharger-driver/main/docs/screenshots/uploads-settings.png" alt="Metabase's upload settings with a Hardcharger database and schema chosen" width="720">
+</p>
+
+**Uploads.** Under **Admin > Settings > Uploads**, choose the Hardcharger database and a schema (and,
+if you like, a prefix for the tables), then **Enable uploads**. From then on a CSV dropped into a collection becomes a table in
+that schema and a model on top of it; **Disable uploads** on the same page turns them off again. The
+same over the API:
+
+```bash
+curl -sS -X POST "$METABASE_URL/api/upload/csv" \
+  -H "X-Metabase-Session: $METABASE_SESSION" \
+  -F collection_id=root -F "file=@orders.csv"
+```
+
+It answers with the new model's id (and the table's in the `metabase-table-id` header).
+`POST /api/table/<table id>/append-csv` and `/replace-csv` take a file the same way.
+
+| A CSV column of | becomes |
+|---|---|
+| whole numbers | `BIGINT` |
+| numbers with a fraction | `DOUBLE` |
+| `true` / `false` | `BOOLEAN` |
+| dates | `DATE` |
+| dates with a time | `TIMESTAMP`, exactly as written |
+| dates with a time and an offset (`2026-03-08T01:30:00-05:00`, `...Z`) | `TIMESTAMP WITH TIME ZONE`: the instant, whatever the offset it was written with |
+| anything else | `VARCHAR` |
+
+None of that depends on a time zone: the zone of Metabase's JVM, the report time zone and the server's
+zone do not change what is stored. Appending a file whose values no longer fit widens the column (whole
+numbers to `DOUBLE`, booleans to `BIGINT`) and adds columns the table didn't have. Metabase's open-source
+edition has no screen to delete an uploaded table: drop it in Hardcharger (`DROP TABLE uploads."..."`).
+
+**Transforms.** Turn transforms on in Metabase (the `transforms-enabled` setting; a self-hosted Metabase
+has it off until an admin enables it). A transform writes a query's result to a table of its own, in an
+existing schema or one it creates; running it again replaces that table in one transaction, so readers
+see the old table or the new one, never neither. Deleting a transform's table from Metabase drops it.
+
+**Privileges.** On a server without access control the connection's user can do all of this. With it,
+grant what is used and no more. These statements are from this repository's end-to-end check, where a
+user with exactly them uploads, appends and runs transforms into the `uploads` schema:
+
+```sql
+CREATE ROLE loader;
+GRANT SELECT ON SCHEMA shop TO loader;              -- what the questions and transforms read
+GRANT ALL PRIVILEGES ON SCHEMA uploads TO loader;   -- where uploads and transforms write
+CREATE USER uploader WITH PASSWORD '...';
+GRANT loader TO uploader;
+```
+
+A transform into a schema that does not exist yet also needs `CREATE SCHEMA` on the catalog. Without a
+privilege, the upload or the transform run fails with the server's own reason, for example:
+
+```text
+Permission Error: Hardcharger blocked this statement: user viewer has no CREATE TABLE privilege on schema memory.uploads.
+```
 
 ## Types
 
@@ -183,7 +248,10 @@ Every push runs, against a real Hardcharger server:
 - **An end-to-end check**: the Metabase Docker image with the built jar; the database is added through the
   API, synced, queried from the query builder and in SQL, under a non-UTC report time zone, cancelled
   mid-query, put on a dashboard that is rendered in a browser, and connected over TLS with a private CA and
-  with a client certificate.
+  with a client certificate. A CSV with every upload type is uploaded, appended to, replaced and widened;
+  transforms are created, run, run again and dropped; both are tried as a user without the privileges and
+  as one with just enough; and the upload's dates and times are checked with the Metabase JVM, the report
+  time zone and the Hardcharger server in three different zones each.
 
 Releases are published only after both have passed on the tagged commit.
 
@@ -194,7 +262,8 @@ What the suite does not run for this driver, and why:
 | UUID value tests (`:uuid-type`) | UUID values arrive as text (see Types) |
 | Materialized view sync | DuckDB has no materialized views |
 | Binary columns read as timestamps (two datasets) | Metabase's datasets name the binary column's type per built-in driver; a community driver cannot add its own. The conversion is tested in this repository instead |
-| Uploads, actions, persistence, transforms, impersonation, routing, JSON unfolding | Not supported (above) |
+| Actions, persistence, Python transforms, impersonation, routing, JSON unfolding | Not supported (above) |
+| Two transform tests about database routing | They need code from Metabase's `enterprise/` directory on the class path |
 | Metabase's `enterprise/` tests | They are under Metabase's commercial licence and test features this driver does not declare |
 
 ## Develop

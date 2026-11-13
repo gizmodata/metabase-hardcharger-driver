@@ -7,6 +7,7 @@
   (:require
    [clojure.java.jdbc :as jdbc]
    [clojure.string :as str]
+   [honey.sql :as sql]
    [java-time.api :as t]
    [metabase.driver :as driver]
    [metabase.driver-api.core :as driver-api]
@@ -14,6 +15,7 @@
    [metabase.driver.sql-jdbc :as sql-jdbc]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.quoting :refer [dot-qualified quote-identifier with-quoting]]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
@@ -43,6 +45,38 @@
 (driver/register! :hardcharger, :parent :sql-jdbc)
 
 (defmethod driver/display-name :hardcharger [_driver] "Hardcharger")
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                       The dialect Metabase parses SQL in                                       |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; Metabase parses native SQL with sqlglot: to order transforms by the tables their SQL reads, to track what a
+;; native question depends on, to check a query's columns. It picks the sqlglot dialect in
+;; `metabase.sql-tools.sqlglot.core/driver->dialect`, a `case` over Metabase's own drivers that hands any other
+;; driver's name on as the dialect, and sqlglot has none called "hardcharger" (it throws `Unknown dialect`).
+;; Hardcharger's SQL is DuckDB's, which sqlglot does have. A driver cannot say so through any interface (the
+;; function's own source asks "Should this be a driver multimethod?"), so this wraps that one function to answer
+;; "duckdb" for this driver and leaves every other driver's answer to it. If Metabase moves the function, the
+;; wrap is skipped with a warning, and those features fail for this driver as they would for any unlisted one.
+(defn- duckdb-dialect-for-hardcharger [driver->dialect]
+  (with-meta
+   (fn [driver]
+     (if (= driver :hardcharger)
+       "duckdb"
+       (driver->dialect driver)))
+   {::wrapped true}))
+
+(defn- teach-metabase-the-dialect! []
+  (try
+    ;; not an API namespace of Metabase's: that is the point of the comment above
+    (let [dialect-var #_{:clj-kondo/ignore [:metabase/modules]}
+                      (requiring-resolve 'metabase.sql-tools.sqlglot.core/driver->dialect)]
+      (when-not (::wrapped (meta @dialect-var))
+        (alter-var-root dialect-var duckdb-dialect-for-hardcharger)))
+    (catch Throwable e
+      (log/warnf e "Could not tell Metabase to parse Hardcharger's SQL as DuckDB's: %s" (ex-message e)))))
+
+(teach-metabase-the-dialect!)
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                    Features                                                    |
@@ -82,10 +116,6 @@
          :regex/lookaheads-and-lookbehinds     false
          ;; GROUP BY GROUPING SETS with GROUPING(a, b, ...)
          :native-pivot-tables                  true
-         ;; Metabase parses native SQL with sqlglot, under a dialect it picks from the driver's name in a closed
-         ;; list (metabase.sql-tools.sqlglot.core/driver->dialect); an unlisted driver's name is passed on as the
-         ;; dialect, and sqlglot has none called "hardcharger". So what depends on parsing native SQL is off.
-         :dependencies/native                  false
          ;; One Metabase database is one catalog; other catalogs are reachable from SQL by their full name.
          :multi-level-schema                   false
          :connection/multiple-databases        false
@@ -98,15 +128,24 @@
          :index/fetch                          false
          :index/standalone-create              false
          :index/inline-create                  false
-         ;; Writing features. None is implemented: each needs DDL and error handling proven against Metabase's
-         ;; own tests before it is offered.
+         ;; CSV uploads and table transforms. Always on, with no switch of this driver's own: a Hardcharger
+         ;; server is writable for whoever holds the grants, uploads stay off until an admin picks this
+         ;; database and a schema for them in Metabase's settings (and can turn them off there again), and a
+         ;; transform exists only once someone creates it. A user without the privilege gets the server's
+         ;; refusal, which names the privilege.
+         :uploads                              true
+         ;; DuckDB has no auto-incrementing column type, so an uploaded table gets no _mb_row_id column.
+         :upload-with-auto-pk                  false
+         :transforms/table                     true
+         ;; a transform's table is replaced by renaming, inside one transaction
+         :rename                               true
+         :atomic-renames                       true
+         ;; The other writing features are not implemented: each needs its own DDL and error handling, proven
+         ;; against Metabase's tests, before it is offered.
          :actions                              false
          :actions/custom                       false
          :actions/data-editing                 false
          :persist-models                       false
-         :uploads                              false
-         :upload-with-auto-pk                  false
-         :transforms/table                     false
          :transforms/python                    false
          :transforms/testing                   false
          ;; Access control (Enterprise features that need SET ROLE or per-user connections)
@@ -541,13 +580,6 @@
           cat
           [excluded schemas tables])))
 
-;; The tables a native query depends on. Metabase finds the ones named in the SQL text by parsing it with
-;; sqlglot, which it cannot do for this driver (see :dependencies/native above), so this answers the ones that
-;; need no parsing: tables referenced through {{table}} template tags.
-(defmethod driver/native-query-deps :hardcharger
-  [_driver query]
-  (into #{} (driver-api/native-query-table-references query)))
-
 (defmethod driver/table-exists? :hardcharger
   [driver database {:keys [schema name]}]
   (boolean
@@ -561,6 +593,136 @@
                  " WHERE table_catalog = current_database() AND table_schema = current_schema()"
                  " AND table_name = ?")
             name])))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                        CSV uploads and table transforms                                        |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; :sql-jdbc already creates, drops and truncates tables and inserts rows (as bound parameters, in one
+;; transaction). What follows is where DuckDB differs.
+
+(defn- schemas-sql
+  "The schemas of the session's catalog. JDBC metadata lists the schemas of every catalog of the server, so two
+  catalogs' `main` would be told apart by nothing."
+  [driver]
+  (let [[excluded-sql excluded] (in-list "schema_name NOT" (sort (sql-jdbc.sync/excluded-schemas driver)))]
+    (into [(str "SELECT schema_name AS \"schema\" FROM information_schema.schemata"
+                " WHERE catalog_name = current_database()" excluded-sql
+                " ORDER BY schema_name")]
+          excluded)))
+
+;; The schemas an admin may choose from for uploads
+(defmethod driver/syncable-schemas :hardcharger
+  [driver database]
+  (let [[inclusion-patterns exclusion-patterns] (schema-filter-patterns driver database)]
+    (into #{}
+          (comp (map :schema)
+                (remove #(re-find #"^metabase_cache" (str %)))
+                (filter #(driver.s/include-schema? inclusion-patterns exclusion-patterns %)))
+          (query-rows driver database (schemas-sql driver)))))
+
+(defmethod driver/schema-exists? :hardcharger
+  [driver db-id schema]
+  (boolean
+   (seq (query-rows driver db-id
+                    [(str "SELECT 1 AS found FROM information_schema.schemata"
+                          " WHERE catalog_name = current_database() AND schema_name = ?")
+                     schema]))))
+
+(defmethod driver/create-schema-if-needed! :hardcharger
+  [driver conn-spec schema]
+  (when-not (str/blank? schema)
+    (driver/execute-raw-queries!
+     driver conn-spec
+     [[(format "CREATE SCHEMA IF NOT EXISTS %s" (sql.u/quote-name driver :schema schema))]])))
+
+(defmethod driver/upload-type->database-type :hardcharger
+  [_driver upload-type]
+  (case upload-type
+    :metabase.upload/varchar-255     [:varchar]
+    :metabase.upload/text            [:varchar]
+    :metabase.upload/int             [:bigint]
+    :metabase.upload/float           [:double]
+    :metabase.upload/boolean         [:boolean]
+    :metabase.upload/date            [:date]
+    :metabase.upload/datetime        [:timestamp]
+    :metabase.upload/offset-datetime [:timestamp-with-time-zone]))
+
+;; The column type for a Metabase type, when a transform creates a table from a list of columns
+(defmethod driver/type->database-type :hardcharger
+  [_driver base-type]
+  (condp #(isa? %2 %1) base-type
+    :type/Boolean        [:boolean]
+    :type/BigInteger     [:bigint]
+    :type/Integer        [:integer]
+    :type/Decimal        [:decimal 38 9]
+    :type/Float          [:double]
+    :type/Number         [:bigint]
+    :type/Date           [:date]
+    :type/DateTimeWithTZ [:timestamp-with-time-zone]
+    :type/DateTime       [:timestamp]
+    :type/Time           [:time]
+    :type/UUID           [:uuid]
+    :type/JSON           [:json]
+    :type/Text           [:varchar]
+    :type/TextLike       [:varchar]
+    ;; Metabase falls back to text for a type that has no column type
+    (throw (IllegalArgumentException. (format "No Hardcharger column type for %s" base-type)))))
+
+;; DuckDB puts no limit on the length of a name, but Metabase wants a number to cut an uploaded file's name to
+;; (and its own table-name column is not endless).
+(defmethod driver/table-name-length-limit :hardcharger [_driver] 128)
+
+;; What a later file may widen a column to: DuckDB casts whole numbers to DOUBLE, and booleans to 1 and 0.
+(defmethod driver/allowed-promotions :hardcharger
+  [_driver]
+  {:metabase.upload/int     #{:metabase.upload/float}
+   :metabase.upload/boolean #{:metabase.upload/int :metabase.upload/float}})
+
+(defn- execute-in-transaction!
+  "Run `statements` (SQL strings) on a write connection of the database, all or none."
+  [db-id statements]
+  (jdbc/with-db-transaction [conn (sql-jdbc.conn/db->pooled-connection-spec (driver.u/lib-database db-id))]
+    (doseq [statement statements]
+      (jdbc/execute! conn [statement]))))
+
+(defn- alter-table-sql
+  "One `ALTER TABLE` statement per column: DuckDB takes one change per statement."
+  [driver table-name clause column-definitions]
+  (with-quoting driver
+    (vec
+     (for [[column-name column-type] column-definitions]
+       (first (sql/format {:alter-table (dot-qualified table-name)
+                           clause       [(into [(quote-identifier column-name)]
+                                               (concat (when (= clause :alter-column) [:type])
+                                                       (if (string? column-type) [[:raw column-type]] column-type)))]}
+                          :quoted true
+                          :dialect (sql.qp/quote-style driver)))))))
+
+(defmethod driver/add-columns! :hardcharger
+  [driver db-id table-name column-definitions & {:keys [primary-key]}]
+  (when (seq primary-key)
+    ;; only asked for by drivers with :upload-with-auto-pk
+    (throw (ex-info "Hardcharger cannot add a primary key column to an existing table."
+                    {:type driver-api/qp.error-type.unsupported-feature})))
+  (execute-in-transaction! db-id (alter-table-sql driver table-name :add-column column-definitions)))
+
+(defmethod driver/alter-table-columns! :hardcharger
+  [driver db-id table-name column-definitions & _opts]
+  (execute-in-transaction! db-id (alter-table-sql driver table-name :alter-column column-definitions)))
+
+;; Swap a transform's new table in for the old one: every rename, or none.
+(defmethod driver/rename-tables!* :hardcharger
+  [driver db-id sorted-rename-map]
+  (execute-in-transaction!
+   db-id
+   (with-quoting driver
+     (vec
+      (for [[from-table to-table] sorted-rename-map]
+        (first (sql/format {:alter-table  (dot-qualified from-table)
+                            :rename-table (keyword (name (keyword to-table)))}
+                           :quoted true
+                           :dialect (sql.qp/quote-style driver))))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                            Reading and binding values                                          |

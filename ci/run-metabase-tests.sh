@@ -33,8 +33,16 @@ log="$root/target/metabase-tests.log"
 status=0
 # The open-source edition only (no :ee alias): Metabase's enterprise/ tree is under its commercial
 # licence, and its tests are for features this driver does not declare.
+#
+# Two tests in the open-source tree cannot run in that edition for any driver with table transforms:
+# they build a database-routing setup (`:model/DatabaseRouter`), whose code is in enterprise/, and
+# stop with "Could not locate metabase_enterprise/database_routing/models". They are named here
+# rather than left to fail; database routing is a feature this driver does not declare.
+ignored='{:vars ["metabase.transforms.execute-test/run-mbql-transform-fails-with-routing-test"
+                 "metabase.transforms.execute-test/run-mbql-transform-anonymous-user-routing-error-test"]}'
 (cd "$metabase" && DRIVERS=hardcharger clojure -X:dev:ci:drivers:drivers-dev:test \
-    :only-tags '[:mb/driver-tests]' :exclude-tags '[:mb/transforms-python-test]' "$@") 2>&1 | tee "$log" || status=$?
+    :only-tags '[:mb/driver-tests]' :exclude-tags '[:mb/transforms-python-test]' \
+    :ignored "$ignored" "$@") 2>&1 | tee "$log" || status=$?
 if [ "$status" -ne 0 ]; then
   echo "the test runner exited with $status" >&2
 fi

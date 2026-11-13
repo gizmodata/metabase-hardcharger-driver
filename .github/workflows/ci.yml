@@ -8,7 +8,8 @@ name: CI
 #   - metabase-tests: Metabase's driver test suite (every test tagged :mb/driver-tests in its
 #     open-source test tree) and this driver's own tests, against a real hardcharger-server.
 #   - e2e: a real Metabase (the Docker image of that version) with the built jar, against real
-#     hardcharger-servers: plugin, sync, queries, time zone, cancel, dashboard in a browser, TLS.
+#     hardcharger-servers: plugin, sync, queries, time zone, cancel, dashboard in a browser, TLS,
+#     CSV uploads and table transforms (also without the privileges, and across time zones).
 #
 # The tests need a server: they FAIL when there is none. Nothing skips for that.
 #

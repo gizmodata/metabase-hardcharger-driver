@@ -15,6 +15,7 @@
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.util :as driver.u]
+   [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
    [metabase.query-processor :as qp]
    [metabase.query-processor.pipeline :as qp.pipeline]
@@ -589,3 +590,120 @@
          (jdbc/execute! {:connection conn} ["CREATE OR REPLACE TABLE main.hc_read_only_probe (i INTEGER)"])
          (is (= [{:n 0}] (jdbc/query {:connection conn} ["SELECT count(*) AS n FROM main.hc_read_only_probe"])))
          (jdbc/execute! {:connection conn} ["DROP TABLE main.hc_read_only_probe"]))))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                        CSV uploads and table transforms                                        |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; Metabase's own upload and transform tests run for this driver now that it declares the features. These cover
+;; what is this driver's own underneath them.
+
+(deftest ^:parallel writing-features-test
+  (testing "uploads and table transforms are offered; the writing features that are not implemented are not"
+    (are [feature supported?] (= supported? (driver/database-supports? :hardcharger feature nil))
+      :uploads                true
+      :transforms/table       true
+      :upload-with-auto-pk    false
+      :actions                false
+      :actions/custom         false
+      :actions/data-editing   false
+      :persist-models         false
+      :transforms/python      false)))
+
+(deftest ^:parallel upload-types-test
+  (are [upload-type column-type] (= column-type (driver/upload-type->database-type :hardcharger upload-type))
+    :metabase.upload/varchar-255     [:varchar]
+    :metabase.upload/text            [:varchar]
+    :metabase.upload/int             [:bigint]
+    :metabase.upload/float           [:double]
+    :metabase.upload/boolean         [:boolean]
+    :metabase.upload/date            [:date]
+    :metabase.upload/datetime        [:timestamp]
+    :metabase.upload/offset-datetime [:timestamp-with-time-zone])
+  (testing "what a column may be widened to is closed under itself, as Metabase asks"
+    (let [promotions (driver/allowed-promotions :hardcharger)]
+      (is (every? (fn [[_from tos]]
+                    (every? (fn [to] (every? tos (get promotions to))) tos))
+                  promotions)))))
+
+(deftest ^:parallel sql-is-parsed-as-duckdb-test
+  (testing "Metabase parses this driver's native SQL in sqlglot's DuckDB dialect, and other drivers' as before"
+    (let [driver->dialect @(requiring-resolve 'metabase.sql-tools.sqlglot.core/driver->dialect)]
+      (is (= "duckdb" (driver->dialect :hardcharger)))
+      (is (= "postgres" (driver->dialect :postgres)))
+      (is (= "tsql" (driver->dialect :sqlserver)))
+      (is (nil? (driver->dialect :h2)))))
+  (mt/test-driver :hardcharger
+    (testing "so the tables a DuckDB-only statement reads are found"
+      (is (= #{{:table (mt/id :orders)} {:table (mt/id :products)}}
+             (driver/native-query-deps
+              :hardcharger
+              (lib/native-query (mt/metadata-provider)
+                                (str "SELECT o.* EXCLUDE (tax), list_value(p.price) AS prices "
+                                     "FROM main.orders o JOIN main.products p ON p.id = o.product_id "
+                                     "QUALIFY row_number() OVER (PARTITION BY o.user_id ORDER BY o.id) = 1"))))))))
+
+(defn- uploads-schema-tables []
+  (into #{} (map first)
+        (native-rows (str "SELECT table_name FROM information_schema.tables"
+                          " WHERE table_catalog = current_database() AND table_schema = 'hc_write_test'"))))
+
+(deftest schemas-and-table-ddl-test
+  (mt/test-driver :hardcharger
+    (let [spec (driver/connection-spec :hardcharger (metadata-db))]
+      (try
+        (testing "a schema is made once, and seen"
+          (is (false? (driver/schema-exists? :hardcharger (mt/id) "hc_write_test")))
+          (driver/create-schema-if-needed! :hardcharger spec "hc_write_test")
+          (driver/create-schema-if-needed! :hardcharger spec "hc_write_test")
+          (is (true? (driver/schema-exists? :hardcharger (mt/id) "hc_write_test")))
+          (is (contains? (driver/syncable-schemas :hardcharger (metadata-db)) "hc_write_test")))
+        (testing "the schemas offered for uploads are this catalog's, without the system ones"
+          (let [schemas (driver/syncable-schemas :hardcharger (metadata-db))]
+            (is (contains? schemas "main"))
+            (is (not-any? schemas ["information_schema" "pg_catalog"]))))
+        (testing "create, insert every upload type, widen, add a column, rename, truncate, drop"
+          (driver/create-table! :hardcharger (mt/id) :hc_write_test/t1
+                                {:n         (driver/upload-type->database-type :hardcharger :metabase.upload/int)
+                                 :flag      (driver/upload-type->database-type :hardcharger :metabase.upload/boolean)
+                                 :at_local  (driver/upload-type->database-type :hardcharger :metabase.upload/datetime)
+                                 :at_offset (driver/upload-type->database-type :hardcharger :metabase.upload/offset-datetime)
+                                 :on_date   (driver/upload-type->database-type :hardcharger :metabase.upload/date)
+                                 :label     (driver/upload-type->database-type :hardcharger :metabase.upload/text)})
+          (driver/insert-into! :hardcharger (mt/id) :hc_write_test/t1
+                               [:n :flag :at_local :at_offset :on_date :label]
+                               [[1 true (LocalDateTime/of 2026 3 8 2 30) (OffsetDateTime/of 2026 3 8 1 30 0 0 (ZoneOffset/ofHours -5))
+                                 (LocalDate/of 2026 3 8) "it's \"quoted\"\nand 日本語"]
+                                [2 false nil nil nil nil]])
+          (is (= [[1 true "2026-03-08 02:30:00" 1772951400 "2026-03-08" "it's \"quoted\"\nand 日本語"]
+                  [2 false nil nil nil nil]]
+                 (native-rows (str "SELECT n, flag, strftime(at_local, '%Y-%m-%d %H:%M:%S'), CAST(epoch(at_offset) AS BIGINT),"
+                                   " CAST(on_date AS VARCHAR), label FROM hc_write_test.t1 ORDER BY n"))))
+          (driver/alter-table-columns! :hardcharger (mt/id) :hc_write_test/t1
+                                       {:n    (driver/upload-type->database-type :hardcharger :metabase.upload/float)
+                                        :flag (driver/upload-type->database-type :hardcharger :metabase.upload/int)})
+          (driver/add-columns! :hardcharger (mt/id) :hc_write_test/t1
+                               {:extra  (driver/upload-type->database-type :hardcharger :metabase.upload/text)
+                                :extra2 (driver/upload-type->database-type :hardcharger :metabase.upload/int)})
+          (is (= [["n" "DOUBLE"] ["flag" "BIGINT"] ["at_local" "TIMESTAMP"] ["at_offset" "TIMESTAMP WITH TIME ZONE"]
+                  ["on_date" "DATE"] ["label" "VARCHAR"] ["extra" "VARCHAR"] ["extra2" "BIGINT"]]
+                 (native-rows (str "SELECT column_name, data_type FROM duckdb_columns()"
+                                   " WHERE schema_name = 'hc_write_test' AND table_name = 't1' ORDER BY column_index"))))
+          (is (= [[1.0 1] [2.0 0]] (native-rows "SELECT n, flag FROM hc_write_test.t1 ORDER BY n")))
+          (testing "a swap of two tables is all or nothing"
+            (driver/create-table! :hardcharger (mt/id) :hc_write_test/t2 {:n [:bigint]})
+            (driver/rename-tables! :hardcharger (mt/id) {:hc_write_test/t1 :hc_write_test/t1_old
+                                                          :hc_write_test/t2 :hc_write_test/t1})
+            (is (= #{"t1" "t1_old"} (uploads-schema-tables)))
+            (is (thrown? Exception
+                         (driver/rename-tables! :hardcharger (mt/id) {:hc_write_test/t1     :hc_write_test/t3
+                                                                       :hc_write_test/missing :hc_write_test/t4})))
+            (is (= #{"t1" "t1_old"} (uploads-schema-tables)) "the first rename was rolled back with the second"))
+          (driver/truncate! :hardcharger (mt/id) :hc_write_test/t1_old)
+          (is (= [[0]] (native-rows "SELECT count(*) FROM hc_write_test.t1_old")))
+          (driver/drop-table! :hardcharger (mt/id) :hc_write_test/t1_old)
+          (driver/drop-table! :hardcharger (mt/id) :hc_write_test/t1)
+          (is (= #{} (uploads-schema-tables))))
+        (finally
+          (execute-on-server! "DROP SCHEMA IF EXISTS hc_write_test CASCADE"))))))
+

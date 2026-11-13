@@ -2,6 +2,8 @@
 -- the answers it expects from the same formulas and compares them with what Metabase returns.
 
 CREATE SCHEMA shop;
+-- Where the upload checks put their tables.
+CREATE SCHEMA uploads;
 
 CREATE TABLE shop.customers (
   id        INTEGER PRIMARY KEY,
